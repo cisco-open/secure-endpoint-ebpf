@@ -36,15 +36,36 @@
 #   define RHEL_RELEASE_CODE RHEL_RELEASE_VERSION(0,0)
 #endif
 
-/* Because we have to unroll loops, increasing MAX_PATH_SEGS increases the BPF
- * program size. This number is set to the highest possible value: */
-#define MAX_PATH_SEGS 60
+/* MAX_PATH_SEGS determines the number of path segments each iteration
+ * of the program can resolve. Because we have to unroll loops, increasing 
+ * MAX_PATH_SEGS increases the BPF program size. This number is set to near 
+ * the highest possible value: */
+#define MAX_PATH_SEGS 72
+
+/* Tail depth determines the maximum number of times the program will tail
+ * before jumping to the end program which submits the event. It is set to 
+ * the maximum possible value. */
+#define TAIL_DEPTH 30
+
+/* defining indexes of tailing programs */
+#define PATH_LOOP_PROG 0
+#define PATH_END_PROG 1
+#define RENAME_LOOP_PROG 2
+#define RENAME_END_PROG 3
+
+/* NAME_MAX added to pacify verifier in case of 2048 segment path
+* where last path still COULD be 256 chars from the perspective of the 
+* verifier. */
+#define PATH_ARR_SIZE PATH_MAX+NAME_MAX+1
 
 /* Increasing the LRU cache size is relatively cheap. 
  * Key = 128 bits, Value = 64 bits, Total = 192 bits.
  * 192 bits * 65535 = 1.57 MB */
 #define DEFAULT_LRU_CACHE_SIZE 65535
 #define DEFAULT_LRU_CACHE_TTL_SECS 30
+
+/* Max pids on a 32-bit linux system */
+#define EXCLUDED_PIDS_MAX 31248
 
 typedef enum ebpf_proc_file_fn {
     EBPF_FN_FILE_CREATE,
@@ -93,13 +114,13 @@ typedef struct ebpf_rename_event_info {
 
 typedef struct ebpf_path_event {
     ebpf_common_event_info_t event_info;
-    char path_name[PATH_MAX];
+    char path_name[PATH_ARR_SIZE]; 
 } ebpf_path_event_t;
 
 typedef struct ebpf_rename_event {
     ebpf_common_event_info_t path_event_info;
     ebpf_rename_event_info_t event_info;
-    char paths[2 * PATH_MAX];
+    char paths[2 * (PATH_ARR_SIZE)];
 } ebpf_rename_event_t;
 
 typedef struct ebpf_unique_file_event {
@@ -108,6 +129,10 @@ typedef struct ebpf_unique_file_event {
     unsigned int dev_major;
     unsigned int dev_minor;
 } ebpf_unique_file_event_t;
+
+typedef struct dentry_pointer {
+    struct dentry* first_dentry;
+} dentry_pointer_t;
 
 typedef struct do_mmap_exclusion_key {
     unsigned int dev_major;
@@ -127,59 +152,31 @@ BPF_TABLE("lru_hash", ebpf_unique_file_event_t, u64, recent_read_events, DEFAULT
 /* Use an LRU hash table so we can minimize modify event duplication */
 BPF_TABLE("lru_hash", ebpf_unique_file_event_t, u64, recent_modify_events, DEFAULT_LRU_CACHE_SIZE);
 
-/* Monitored __fput in progress, keyed on thread ID */
-BPF_HASH(__fput_calls, u32, ebpf_path_event_t);
+/* Holds path event from probe to pass to loop/end programs */
+BPF_PERCPU_ARRAY(loop_event_p, ebpf_path_event_t, 1); 
 
 /* Monitored vfs_rename in progress, keyed on thread ID */
 BPF_HASH(vfs_rename_calls, u32, ebpf_rename_event_t);
-
-/* Monitored vfs_write in progress, keyed on thread ID */
-BPF_HASH(vfs_write_calls, u32, ebpf_path_event_t);
-
-/* Monitored do_truncate in progress, keyed on thread ID */
-BPF_HASH(do_truncate_calls, u32, ebpf_path_event_t);
-
-/* Monitored vfs_unlink in progress, keyed on thread ID */
-BPF_HASH(vfs_unlink_calls, u32, ebpf_path_event_t);
-
-/* Monitored vfs_open in progress, keyed on thread ID */
-BPF_HASH(vfs_open_calls, u32, ebpf_path_event_t);
-
-/* Monitored vfs_symlink in progress, keyed on thread ID */
-BPF_HASH(vfs_symlink_calls, u32, ebpf_path_event_t);
-
-/* Monitored vfs_link in progress, keyed on thread ID */
-BPF_HASH(vfs_link_calls, u32, ebpf_path_event_t);
-
-/* Monitored vfs_read in progress, keyed on thread ID */
-BPF_HASH(vfs_read_calls, u32, ebpf_path_event_t);
-
-/* Monitored do_mmap in progress, keyed on thread ID */
-BPF_HASH(do_mmap_calls, u32, ebpf_path_event_t);
+BPF_PERCPU_ARRAY(rename_ret, int, 1);
+BPF_HASH(leaf_dentry, u32, struct dentry_pointer);
 
 /* Monitored proc_*_connector in progress, keyed on thread ID */
 BPF_HASH(proc_connector_calls, u32, ebpf_path_event_t);
 
-BPF_TABLE("extern", pid_t, u32, excluded_pids, 1);
+BPF_TABLE("extern", pid_t, u32, excluded_pids, EXCLUDED_PIDS_MAX);
+
+/* Holds FDs of programs */
+BPF_PROG_ARRAY(programs_table, 4);
+
+/* Depth of tailing. This value is used to track how deep into tail calls
+ * we are. It must be reset before we start the path-resolving loop programs
+ * since it is persistent between probes/programs */
+BPF_PERCPU_ARRAY(path_lookup_depth, int, 1);
 
 BPF_TABLE("extern", do_mmap_exclusion_key_t, u32, do_mmap_exclusions, 4);
 
 BPF_PERF_OUTPUT(events);
 
-/* bpf_probe_read_str that can detect truncation */
-static int _probe_read_str(char *out, size_t outsize, const char *in)
-{
-    char nullbyte;
-    int len = bpf_probe_read_str(out, outsize, in);
-    if ((len > 0) &&
-        (len == outsize) &&
-        (bpf_probe_read(&nullbyte, 1, &in[len-1]) == 0) &&
-        (nullbyte != '\0')) {
-       // truncated
-       len = 0;
-    }
-    return len;
-}
 
 static bool exclude_tgid(u32 tgid)
 {
@@ -207,61 +204,195 @@ static bool _is_executable_memory_map(unsigned long prot)
     return (prot & PROT_EXEC);
 }
 
-static void _set_generic_path(struct dentry *dentry, char *path, unsigned int *path_size)
-{
-    int i;
-    int len;
-    bool path_name_valid = false;
-    unsigned int offs = 0;
-
-     /* This loop is unrolled, so attempt to make the body as
-      * compact as possible in terms of code size. */
- #pragma unroll MAX_PATH_SEGS
-     for (i = 0; i < MAX_PATH_SEGS; i++) {
-         /* NAME_MAX does not include the null terminator, so we add
-          * 1 here. The below check is to confirm we have enough space
-          * to fit another path segment. */
-         if (offs > PATH_MAX - (NAME_MAX+1)) {
-             break;
-         }
-         len = _probe_read_str(&path[offs],
-                               NAME_MAX+1,
-                               dentry->d_name.name);
-         if (len <= 0) {
-             break;
-         }
-         offs += len;
-         if (dentry == dentry->d_parent) {
-             /* complete */
-             path_name_valid = true;
-             break;
-         }
-         dentry = dentry->d_parent;
-     }
-     if (path_name_valid) {
-         *path_size = offs;
-     }
-}
-
-static void _set_from_path_name(ebpf_rename_event_t *event)
-{
-    _set_generic_path(event->path_event_info.dentry, &event->paths[0], &event->event_info.from_path_name_size);
-}
-
-static void _set_src_path_name(ebpf_rename_event_t *event)
-{
-    if (event->event_info.from_path_name_size < PATH_MAX) {
-        _set_generic_path(event->path_event_info.dentry,
-                        &event->paths[event->event_info.from_path_name_size],
-                        &event->path_event_info.path_name_size);
+/* path dentry lookup */
+int path_lookup_program(void* ctx){
+    int idx = 0;
+    int new_depth = 1;
+    // Check depth of tailing to determine whether end further loop program tails
+    // and submit what we have already resolved in the event
+    int* depth = (int*)path_lookup_depth.lookup(&idx);
+    if (depth != NULL){
+        new_depth = *depth + 1;   
+        if (*depth >= TAIL_DEPTH){
+            programs_table.call(ctx, PATH_END_PROG);
+            return 0;
+        }
     }
+    path_lookup_depth.update(&idx, &new_depth);
+
+    ebpf_path_event_t* event = (ebpf_path_event_t*)loop_event_p.lookup(&idx);
+    if (!event){
+        return 0;
+    }
+    
+    ebpf_common_event_info_t e_info;
+    bpf_probe_read_kernel(&e_info, sizeof(ebpf_common_event_info_t), &event->event_info);
+    
+    struct dentry de;
+    struct dentry* old = e_info.dentry;
+    bpf_probe_read_kernel(&de, sizeof(struct dentry), e_info.dentry);
+
+    int len = 0;
+    #pragma unroll
+    for (int i = 1; i < MAX_PATH_SEGS; i++) {
+        struct qstr namestr;
+        bpf_probe_read_kernel(&namestr, sizeof(struct qstr), &de.d_name);
+
+        int offset = event->event_info.path_name_size;
+                
+        // If next read has the potential to exceed the array size then exit early
+        if (offset > PATH_MAX || offset < 0){
+            event->event_info.path_name_size = 0;
+            programs_table.call(ctx, PATH_END_PROG);
+            return 0;
+        }
+
+        int len = bpf_probe_read_str(&event->path_name[offset], 
+                                    NAME_MAX+1, 
+                                    namestr.name);
+        // To detect truncation
+        char nullbyte;
+        if ((len > 0) &&
+            (len == NAME_MAX+1) &&
+            (bpf_probe_read(&nullbyte, 1, &namestr.name[len-1]) == 0) &&
+            (nullbyte != '\0')) {
+            // truncated
+            len = 0;
+        }
+
+        if (len <= 0){
+            event->event_info.path_name_size = 0;
+            programs_table.call(ctx, PATH_END_PROG);
+            return 0;
+        }
+
+        event->event_info.path_name_size += len;
+
+        if (old == de.d_parent) { // reached root directory
+            programs_table.call(ctx, PATH_END_PROG);
+        }
+        
+        old = de.d_parent;
+        bpf_probe_read_kernel(&de, sizeof(struct dentry), de.d_parent);
+    }
+    
+    // Since local variables are lost on a tail, we store the next dentry to be read
+    // in the event struct so that the next loop program can continue to loop from 
+    // the correct location
+    event->event_info.dentry = old;
+    
+    programs_table.call(ctx, PATH_LOOP_PROG);
+    return 0;
 }
 
-static void _set_path_name(ebpf_path_event_t *path_event)
-{
-    _set_generic_path(path_event->event_info.dentry,
-                      &path_event->path_name[0],
-                      &path_event->event_info.path_name_size);
+int rename_lookup_program(void* ctx){    
+    int idx = 0;
+    int new_depth = 1;
+
+    // Check whether program called from return probe
+    int* is_ret_probe = (int*)rename_ret.lookup(&idx);
+    if (is_ret_probe == NULL){
+        return 0;
+    }
+
+    // Check depth of tailing to determine whether end further loop program tails
+    // and submit what we have already resolved in the event
+    int* depth = (int*)path_lookup_depth.lookup(&idx);
+    if (depth != NULL){
+        new_depth = *depth + 1;   
+        if (*depth >= TAIL_DEPTH){
+            if (*is_ret_probe == 1){
+                programs_table.call(ctx, RENAME_END_PROG);
+            }
+            return 0;
+        }
+    }
+    path_lookup_depth.update(&idx, &new_depth);
+
+    u64 tgid_kpid = bpf_get_current_pid_tgid();
+    u32 kpid = tgid_kpid & 0xffffffff;
+
+    ebpf_rename_event_t* event = (ebpf_rename_event_t*)vfs_rename_calls.lookup(&kpid);
+    if (!event){
+        return 0;
+    }
+    
+    ebpf_common_event_info_t e_info;
+    bpf_probe_read_kernel(&e_info, sizeof(ebpf_common_event_info_t), &event->path_event_info);
+    
+    struct dentry de;
+    struct dentry* old = e_info.dentry;
+    bpf_probe_read_kernel(&de, sizeof(struct dentry), e_info.dentry);
+
+    int len = 0;
+    #pragma unroll
+    for (int i = 1; i < MAX_PATH_SEGS; i++) {
+
+        struct qstr namestr;
+        bpf_probe_read_kernel(&namestr, sizeof(struct qstr), &de.d_name);
+        int offset = event->path_event_info.path_name_size + event->event_info.from_path_name_size;
+
+        // If next read has the potential to exceed the array size then exit early.
+        // Since it should not be possible for this to be exceeded except on retprobe
+        // we don't have to check *is_ret_probe value
+        if (offset > 2*PATH_MAX + (NAME_MAX+1) || offset < 0){
+            event->path_event_info.path_name_size = 0;
+            programs_table.call(ctx, PATH_END_PROG);
+            return 0;
+        }
+
+        int len = bpf_probe_read_str(&event->paths[offset], 
+                                    NAME_MAX+1, 
+                                    namestr.name);
+        // To detect truncation
+        char nullbyte;
+        if ((len > 0) &&
+            (len == NAME_MAX+1) &&
+            (bpf_probe_read(&nullbyte, 1, &namestr.name[len-1]) == 0) &&
+            (nullbyte != '\0')) {
+            // truncated
+            len = 0;
+        }
+
+        if (len <= 0){
+            // If on return probe, set path_size to 0 and submit event.
+            if(*is_ret_probe == 1){
+                event->path_event_info.path_name_size = 0;
+                programs_table.call(ctx, PATH_END_PROG);
+            }
+            else{
+                // Set from_path_size to 0 but do not submit, wait for retprobe
+                event->event_info.from_path_name_size = 0;
+            }
+            return 0;
+        }
+        // Separating the below if statements from the above, though it seems redundant,
+        // seems to be considered as fewer instructions by the verifier
+        if (*is_ret_probe == 0){
+            event->event_info.from_path_name_size += len;
+        }
+        else{
+            event->path_event_info.path_name_size += len;
+        }
+
+        // reached root directory
+        if (old == de.d_parent) {
+            // If called from return probe then submit event after path is resolved
+            if (*is_ret_probe == 1){
+                programs_table.call(ctx, RENAME_END_PROG);
+            }
+            return 0;
+        }
+        
+        old = de.d_parent;
+        bpf_probe_read_kernel(&de, sizeof(struct dentry), de.d_parent);
+    }
+
+    // Storing the next dentry to be read in the event struct for the tailing loop program
+    event->path_event_info.dentry = old;
+    
+    programs_table.call(ctx, RENAME_LOOP_PROG);    
+    return 0;
 }
 
 static void _send_path_event(struct pt_regs *ctx, struct task_struct *task,
@@ -289,29 +420,73 @@ static void _send_path_event(struct pt_regs *ctx, struct task_struct *task,
     }
 }
 
-static void _send_rename_event(struct pt_regs *ctx, struct task_struct *task,
-                               ebpf_rename_event_t *event)
-{
-    event->path_event_info.ppid = task->real_parent->tgid;
+int end_program(void* ctx){
 
-    // Although cred and real_cred are available in task.
-    // They seem to contain the same values for uid and euid.
-    event->path_event_info.user.ruid = task->cred->uid.val;
-    event->path_event_info.user.euid = task->cred->euid.val;
-    event->path_event_info.user.gid = task->cred->gid.val;
-    event->path_event_info.parent_user.ruid = task->real_parent->cred->uid.val;
-    event->path_event_info.parent_user.euid = task->real_parent->cred->euid.val;
-    event->path_event_info.parent_user.gid = task->real_parent->cred->gid.val;
+    int idx = 0;
+    ebpf_path_event_t* event = (ebpf_path_event_t*)loop_event_p.lookup(&idx);
+    struct task_struct* task = (struct task_struct *)bpf_get_current_task();
+    if (event){
+        event->event_info.ppid = task->real_parent->tgid;
 
-    /* NULL-out dentry ptr before sending to userland */
-    event->path_event_info.dentry = NULL;
-    /* Don't send a full ebpf_path_event_t as that would be
-     * wasteful. event_size is dependent upon how much of struct
-     * is filled and to be sent. */
-    size_t event_size = sizeof(event->path_event_info) + sizeof(event->event_info) + event->event_info.from_path_name_size + event->path_event_info.path_name_size;
-    if (event_size < sizeof(*event)) {
-        events.perf_submit(ctx, event, event_size);
+        // Although cred and real_cred are available in task.
+        // They seem to contain the same values for uid and euid.
+        event->event_info.user.ruid = task->cred->uid.val;
+        event->event_info.user.euid = task->cred->euid.val;
+        event->event_info.user.gid = task->cred->gid.val;
+        event->event_info.parent_user.ruid = task->real_parent->cred->uid.val;
+        event->event_info.parent_user.euid = task->real_parent->cred->euid.val;
+        event->event_info.parent_user.gid = task->real_parent->cred->gid.val;
+
+        /* NULL-out dentry ptr before sending to userland */
+        event->event_info.dentry = NULL;
+        /* Don't send a full ebpf_path_event_t as that would be
+        * wasteful. event_size is dependent upon how much of struct
+        * is filled and to be sent. */
+        size_t event_size = sizeof(event->event_info) + event->event_info.path_name_size;
+
+        if (event_size < sizeof(*event)) {
+            events.perf_submit(ctx, event, event_size);
+        }
     }
+
+    return 0;
+}
+
+int rename_end_program(void* ctx){
+
+    u64 tgid_kpid = bpf_get_current_pid_tgid();
+    u32 kpid = tgid_kpid & 0xffffffff;
+
+    ebpf_rename_event_t* event = (ebpf_rename_event_t*)vfs_rename_calls.lookup(&kpid);
+    struct task_struct* task = (struct task_struct *)bpf_get_current_task();
+    if (event){
+        event->path_event_info.ppid = task->real_parent->tgid;
+
+        // Although cred and real_cred are available in task.
+        // They seem to contain the same values for uid and euid.
+        event->path_event_info.user.ruid = task->cred->uid.val;
+        event->path_event_info.user.euid = task->cred->euid.val;
+        event->path_event_info.user.gid = task->cred->gid.val;
+        event->path_event_info.parent_user.ruid = task->real_parent->cred->uid.val;
+        event->path_event_info.parent_user.euid = task->real_parent->cred->euid.val;
+        event->path_event_info.parent_user.gid = task->real_parent->cred->gid.val;
+
+        /* NULL-out dentry ptr before sending to userland */
+        event->path_event_info.dentry = NULL;
+        /* Don't send a full ebpf_path_event_t as that would be
+        * wasteful. event_size is dependent upon how much of struct
+        * is filled and to be sent. */
+        size_t event_size = sizeof(event->path_event_info) + sizeof(event->event_info) 
+            + event->event_info.from_path_name_size + event->path_event_info.path_name_size;
+
+        if (event_size < sizeof(*event)) {
+            events.perf_submit(ctx, event, event_size);
+        }
+    }
+    leaf_dentry.delete(&kpid);
+    vfs_rename_calls.delete(&kpid);
+
+    return 0;
 }
 
 static void _set_mount_info(struct inode *inode,
@@ -374,27 +549,26 @@ int proc_exec_connector_probe(struct pt_regs *ctx, struct task_struct *task)
 
     if (_want_inode(path->dentry->d_inode)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = task->pid;
 
-            proc_connector_calls.insert(&kpid, zeroed_event);
-            event = proc_connector_calls.lookup(&kpid);
+            loop_event_p.update(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_PROC_EXEC;
                 event->event_info.tgid = task->tgid;
                 _set_dentry_event(path->dentry->d_inode, path->dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, task, event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            proc_connector_calls.delete(&kpid);
         }
     }
   
-
     return 0;
 }
 
@@ -450,21 +624,35 @@ static int _rename_probe_helper(struct pt_regs *ctx, struct inode *old_dir,
 
     if (_want_inode(new_dir)) {
         int idx = 0;
+        int zero = 0;
         ebpf_rename_event_t *zeroed_event = zeroed_rename_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_rename_event_t *event;
             u32 kpid = tgid_kpid & 0xffffffff;
-
             vfs_rename_calls.insert(&kpid, zeroed_event);
             event = vfs_rename_calls.lookup(&kpid);
             if (event) {
                 event->path_event_info.timestamp_ns = timestamp_ns;
                 event->path_event_info.fn = EBPF_FN_FILE_RENAME;
                 event->path_event_info.tgid = tgid;
+                
+                // old_dentry is the filesystem object that is being renamed (reference). By the time the 
+                // kretprobe fires and assuming vfs_rename succeeded, the data (e.g., name) pointed to by
+                // old_dentry would have been altered to refer to the destination.
                 _set_dentry_event(new_dir, old_dentry, &event->path_event_info);
-                _set_from_path_name(event);
+
+                // storing a pointer to a dentry directly (without use of a struct)
+                // is not permitted by the verifier
+                dentry_pointer_t first_de_pointer;
+                first_de_pointer.first_dentry = old_dentry;
+                leaf_dentry.update(&kpid, &first_de_pointer); 
+
                 _set_from_mount_info(old_dir, event);
+                // Signal that we are not in retprobe by writing a 0 into rename_ret
+                rename_ret.update(&idx, &zero);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth to 0
+                programs_table.call(ctx, RENAME_LOOP_PROG);
             }
         }
     }
@@ -476,15 +664,23 @@ int vfs_rename_retprobe(struct pt_regs *ctx)
 {
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 kpid = tgid_kpid & 0xffffffff;
-
     ebpf_rename_event_t *event = vfs_rename_calls.lookup(&kpid);
     if (event) {
         if (PT_REGS_RC(ctx) == 0) {
-            _set_src_path_name(event);
-            _send_rename_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+            int idx = 0;
+            int zero = 0;
+            int one = 1;
+
+            dentry_pointer_t* og_de = (dentry_pointer_t*)leaf_dentry.lookup(&kpid);
+            if (og_de != NULL){
+                event->path_event_info.dentry = og_de->first_dentry;
+            }
+            // Signal that we are in retprobe by setting rename_ret to 1
+            rename_ret.update(&idx, &one);
+            path_lookup_depth.update(&idx, &zero); // reset tail depth to 0
+            programs_table.call(ctx, RENAME_LOOP_PROG);
         }
     }
-    vfs_rename_calls.delete(&kpid);
     return 0;
 }
 
@@ -564,23 +760,23 @@ int vfs_write_probe(struct pt_regs *ctx,
     
     if (_want_inode(dir)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = tgid_pid & 0xffffffff;
 
-            vfs_write_calls.insert(&kpid, zeroed_event);
-            event = vfs_write_calls.lookup(&kpid);
+            loop_event_p.update(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_FILE_WRITE;
                 event->event_info.tgid = tgid;
                 _set_dentry_event(dir, dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            vfs_write_calls.delete(&kpid);
         }
     }
 
@@ -605,23 +801,23 @@ int do_truncate_probe(struct pt_regs *ctx,
 
     if (_want_inode(dentry->d_inode)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = tgid_kpid & 0xffffffff;
 
-            do_truncate_calls.insert(&kpid, zeroed_event);
-            event = do_truncate_calls.lookup(&kpid);
+            loop_event_p.insert(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_FILE_WRITE;
                 event->event_info.tgid = tgid;
                 _set_dentry_event(dentry->d_inode, dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            do_truncate_calls.delete(&kpid);
         }
     }
 
@@ -645,23 +841,23 @@ int vfs_unlink_probe(struct pt_regs *ctx,
 
     if (_want_inode(dentry->d_inode)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = tgid_kpid & 0xffffffff;
 
-            vfs_unlink_calls.insert(&kpid, zeroed_event);
-            event = vfs_unlink_calls.lookup(&kpid);
+            loop_event_p.insert(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_FILE_UNLINK;
                 event->event_info.tgid = tgid;
                 _set_dentry_event(dentry->d_inode, dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            vfs_unlink_calls.delete(&kpid);
         }
     }
 
@@ -677,8 +873,19 @@ int vfs_open_probe(struct pt_regs *ctx,
                     const struct path *path,
                     struct file *file)
 {   
+    
+    // FMODE_CREATED is not available on older kernels.
+    // Allow FP file.create events in these instances.
+    bool no_fmode_created = false;
+#ifndef FMODE_CREATED
+#define FMODE_CREATED 0
+    no_fmode_created = true;
+#endif
+
     u64 timestamp_ns = bpf_ktime_get_ns();
-    if (file->f_flags & O_CREAT) {
+    if (file->f_mode & FMODE_CREATED ||
+        (no_fmode_created && file->f_flags & O_CREAT)) {
+
         u64 tgid_kpid = bpf_get_current_pid_tgid();
         u32 tgid = tgid_kpid >> 32;
         if (exclude_tgid(tgid)) {
@@ -687,23 +894,23 @@ int vfs_open_probe(struct pt_regs *ctx,
 
         if (_want_inode(path->dentry->d_inode)) {
             int idx = 0;
+            int zero = 0;
             ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
             /* BPF enforces that we check if zeroed_event is NULL */
             if (zeroed_event) {
                 ebpf_path_event_t *event;
                 u32 kpid = tgid_kpid & 0xffffffff;
 
-                vfs_open_calls.insert(&kpid, zeroed_event);
-                event = vfs_open_calls.lookup(&kpid);
+                loop_event_p.insert(&idx, zeroed_event);
+                event = loop_event_p.lookup(&idx);
                 if (event) {
                     event->event_info.timestamp_ns = timestamp_ns;
                     event->event_info.fn = EBPF_FN_FILE_CREATE;
                     event->event_info.tgid = tgid;
                     _set_dentry_event(path->dentry->d_inode, path->dentry, &event->event_info);
-                    _set_path_name(event);
-                    _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                    path_lookup_depth.update(&idx, &zero); //reset tail depth
+                    programs_table.call(ctx, PATH_LOOP_PROG);
                 }
-                vfs_open_calls.delete(&kpid);
             }
         }
     }
@@ -735,23 +942,23 @@ int vfs_symlink_probe(struct pt_regs *ctx,
 
     if (_want_inode(dir)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = tgid_kpid & 0xffffffff;
 
-            vfs_symlink_calls.insert(&kpid, zeroed_event);
-            event = vfs_symlink_calls.lookup(&kpid);
+            loop_event_p.insert(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_FILE_CREATE;
                 event->event_info.tgid = tgid;
                 _set_dentry_event(dir, dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            vfs_symlink_calls.delete(&kpid);
         }
     }
 
@@ -801,23 +1008,23 @@ int vfs_read_probe(struct pt_regs *ctx,
     
     if (_want_inode(dir)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = tgid_pid & 0xffffffff;
 
-            vfs_read_calls.insert(&kpid, zeroed_event);
-            event = vfs_read_calls.lookup(&kpid);
+            loop_event_p.update(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_VFS_READ;
                 event->event_info.tgid = tgid;
                 _set_dentry_event(dir, dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            vfs_read_calls.delete(&kpid);
         }
     }
 
@@ -842,23 +1049,23 @@ int do_mmap_probe(struct pt_regs *ctx, struct file *file, unsigned long addr,
     
     if (_is_executable_memory_map(prot) && _want_inode(dir)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = tgid_pid & 0xffffffff;
 
-            do_mmap_calls.insert(&kpid, zeroed_event);
-            event = do_mmap_calls.lookup(&kpid);
+            loop_event_p.insert(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_DO_MMAP;
                 event->event_info.tgid = tgid;
                 _set_dentry_event(dir, dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            do_mmap_calls.delete(&kpid);
         }
     }
     return 0;
@@ -882,23 +1089,23 @@ int vfs_link_probe(struct pt_regs *ctx,
 
     if (_want_inode(dir)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = tgid_kpid & 0xffffffff;
 
-            vfs_link_calls.insert(&kpid, zeroed_event);
-            event = vfs_link_calls.lookup(&kpid);
+            loop_event_p.update(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_FILE_CREATE;
                 event->event_info.tgid = tgid;
                 _set_dentry_event(dir, new_dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            vfs_link_calls.delete(&kpid);
         }
     }
 
@@ -910,6 +1117,7 @@ int __fput_probe(struct pt_regs *ctx, struct file *file)
     u64 timestamp_ns = bpf_ktime_get_ns();
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_kpid >> 32;
+
     if (exclude_tgid(tgid)) {
         return 0;
     }
@@ -917,23 +1125,23 @@ int __fput_probe(struct pt_regs *ctx, struct file *file)
     const struct path *path = &file->f_path;
     if (file->f_mode & FMODE_WRITE && _want_inode(path->dentry->d_inode)) {
         int idx = 0;
+        int zero = 0;
         ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
         /* BPF enforces that we check if zeroed_event is NULL */
         if (zeroed_event) {
             ebpf_path_event_t *event;
             u32 kpid = tgid_kpid & 0xffffffff;
 
-            __fput_calls.insert(&kpid, zeroed_event);
-            event = __fput_calls.lookup(&kpid);
+            loop_event_p.update(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
             if (event) {
                 event->event_info.timestamp_ns = timestamp_ns;
                 event->event_info.fn = EBPF_FN_FILE_CLOSE_WRITE;
                 event->event_info.tgid = tgid;
                 _set_dentry_event(path->dentry->d_inode, path->dentry, &event->event_info);
-                _set_path_name(event);
-                _send_path_event(ctx, (struct task_struct *)bpf_get_current_task(), event);
+                path_lookup_depth.update(&idx, &zero); //reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
             }
-            __fput_calls.delete(&kpid);
         }
     }
     return 0;

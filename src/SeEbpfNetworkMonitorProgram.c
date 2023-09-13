@@ -43,6 +43,9 @@
 /* MUST be a power of 2 */
 #define AMPNF_TCP_SEND_LIMIT 16384
 
+/* Max pids on a 32-bit linux system */
+#define EXCLUDED_PIDS_MAX 31248
+
 typedef enum {
     ebpf_network_kernel_event_type_connect,
     ebpf_network_kernel_event_type_accept,
@@ -120,7 +123,7 @@ BPF_HASH(sock_bufs, u32, ampnf_sock_buf_t);
 /* Known sockets, keyed on struct sock* */
 BPF_HASH(known_socks, u64, ampnf_known_sock_t);
 
-BPF_TABLE("extern", pid_t, u32, excluded_pids, 1);
+BPF_TABLE("extern", pid_t, u32, excluded_pids, EXCLUDED_PIDS_MAX);
 
 BPF_PERF_OUTPUT(events);
 
