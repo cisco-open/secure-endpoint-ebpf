@@ -31,6 +31,7 @@
 #include <net/sock.h>
 #include <uapi/linux/fcntl.h>
 #include <uapi/linux/ptrace.h>
+
 /* RHEL macros */
 #ifndef RHEL_RELEASE_VERSION
 #   define RHEL_RELEASE_VERSION(a,b) (((a) << 8) + (b))
@@ -38,10 +39,13 @@
 #ifndef RHEL_RELEASE_CODE
 #   define RHEL_RELEASE_CODE RHEL_RELEASE_VERSION(0,0)
 #endif
+
 /* MUST be a power of 2 */
 #define AMPNF_TCP_SEND_LIMIT 16384
+
 /* Max pids on a 32-bit linux system */
 #define EXCLUDED_PIDS_MAX 31248
+
 typedef enum {
     ebpf_network_kernel_event_type_connect,
     ebpf_network_kernel_event_type_accept,
@@ -50,11 +54,13 @@ typedef enum {
     ebpf_network_kernel_event_type_release,
     ebpf_network_kernel_event_type_listen,
 } ebpf_network_kernel_event_type_t;
+
 typedef struct ebpf_user_info {
     uid_t ruid;
     uid_t euid;
     gid_t gid;
 } ebpf_event_user_t;
+
 typedef struct ebpf_network_kernel_event {
     ebpf_network_kernel_event_type_t event_type;
     uint64_t sk_id;
@@ -69,24 +75,30 @@ typedef struct ebpf_network_kernel_event {
     uint32_t payload_size;
     uint64_t timestamp_ns;
 } ebpf_network_kernel_event_t;
+
 typedef struct ebpf_network_payload_kernel_event {
     ebpf_network_kernel_event_t event;
     unsigned char payload[AMPNF_TCP_SEND_LIMIT];
 }  ebpf_network_payload_kernel_event_t;
+
 /* Use an BPF map as the stack is too small to hold ebpf_network_payload_kernel_event_t */
 BPF_ARRAY(zeroed_payload_event_arr, ebpf_network_payload_kernel_event_t, 1);
+
 /* kern_payload_events about to be sent, keyed on thread ID */
 BPF_HASH(payload_events, u32, ebpf_network_payload_kernel_event_t);
+
 typedef struct ampnf_sock_buf {
     struct inet_sock inet_sk;
     struct ipv6_pinfo pinet6;
 } ampnf_sock_buf_t;
+
 typedef enum ampnf_known_sock_type {
     AMPNF_TYPE_NONE = 0,
     AMPNF_TYPE_TCP_CLI,
     AMPNF_TYPE_TCP_SRV,
     AMPNF_TYPE_UDP
 } ampnf_known_sock_type_t;
+
 typedef struct ampnf_known_sock {
     ampnf_known_sock_type_t type;
     /* Socket ID for userland */
@@ -97,23 +109,31 @@ typedef struct ampnf_known_sock {
     /* Bytes sent - useful for TCP */
     uint32_t bytes_sent;
 } ampnf_known_sock_t;
+
 /* Use an BPF map as the stack is too small to hold an ampnf_sock_buf_t */
 BPF_ARRAY(zeroed_sock_buf_arr, ampnf_sock_buf_t, 1);
+
 /* Use a BPF map so we can track the latest known sock ID and increment it
  * atomically */
 BPF_ARRAY(known_sock_template_arr, ampnf_known_sock_t, 1);
+
 /* _getsockinfo in progress, keyed on thread ID */
 BPF_HASH(sock_bufs, u32, ampnf_sock_buf_t);
+
 /* Known sockets, keyed on struct sock* */
 BPF_HASH(known_socks, u64, ampnf_known_sock_t);
+
 BPF_TABLE("extern", pid_t, u32, excluded_pids, EXCLUDED_PIDS_MAX);
+
 BPF_PERF_OUTPUT(events);
+
 /* Adapted from inet6_getname() from net/ipv6/af_inet6.c */
 static int _do_inet6_getname(struct sock *sk, struct ipv6_pinfo *np,
                              struct sockaddr *uaddr, int peer)
 {
     struct sockaddr_in6 *sin = (struct sockaddr_in6 *)uaddr;
     struct inet_sock *inet = inet_sk(sk);
+
     sin->sin6_family = AF_INET6;
     if (peer) {
         if (!inet->inet_dport)
@@ -128,16 +148,19 @@ static int _do_inet6_getname(struct sock *sk, struct ipv6_pinfo *np,
             sin->sin6_addr = np->saddr;
         else
             sin->sin6_addr = sk->sk_v6_rcv_saddr;
+
         sin->sin6_port = inet->inet_sport;
     }
     return sizeof(*sin);
 }
+
 /* Adapted from inet_getname() from net/ipv4/af_inet.c */
 static int _do_inet_getname(struct sock *sk, struct sockaddr *uaddr,
                             int peer)
 {
     struct inet_sock *inet  = inet_sk(sk);
     struct sockaddr_in *sin = (struct sockaddr_in *)uaddr;
+
     sin->sin_family = AF_INET;
     if (peer) {
         if (!inet->inet_dport ||
@@ -155,6 +178,7 @@ static int _do_inet_getname(struct sock *sk, struct sockaddr *uaddr,
     }
     return sizeof(*sin);
 }
+
 static void _getlocalsockinfo(struct sock *sk, struct sockaddr_in6 *local_name)
 {
     ampnf_sock_buf_t *sock_buf;
@@ -162,24 +186,29 @@ static void _getlocalsockinfo(struct sock *sk, struct sockaddr_in6 *local_name)
     u32 pid = tgid_pid & 0xffffffff;
     int idx = 0;
     ampnf_sock_buf_t *zeroed_sock_buf;
+
     zeroed_sock_buf = zeroed_sock_buf_arr.lookup(&idx);
     /* BPF enforces that we check if zeroed_sock_buf is NULL */
     if (!zeroed_sock_buf) {
         goto done;
     }
+
     sock_bufs.insert(&pid, zeroed_sock_buf);
     sock_buf = sock_bufs.lookup(&pid);
     if (!sock_buf) {
         goto done;
     }
+
     if (bpf_probe_read(&sock_buf->inet_sk, sizeof(struct inet_sock), sk)) {
         goto done;
     }
+
     if (sock_buf->inet_sk.pinet6) {
         if (bpf_probe_read(&sock_buf->pinet6, sizeof(struct ipv6_pinfo), sock_buf->inet_sk.pinet6)) {
             goto done;
         }
     }
+
     if (sock_buf->inet_sk.sk.sk_family == PF_INET) {
         (void) _do_inet_getname(&sock_buf->inet_sk.sk, (struct sockaddr *)local_name, 0);
     } else if (sock_buf->inet_sk.sk.sk_family == PF_INET6) {
@@ -187,8 +216,10 @@ static void _getlocalsockinfo(struct sock *sk, struct sockaddr_in6 *local_name)
     }
 done:
     sock_bufs.delete(&pid);
+
     return;
 }
+
 static int _getsockinfo(struct sock *sk,
                         struct sockaddr_in6 *sock_name,
                         struct sockaddr_in6 *peer_name,
@@ -201,6 +232,7 @@ static int _getsockinfo(struct sock *sk,
     ampnf_sock_buf_t *sock_buf;
     u64 tgid_pid = bpf_get_current_pid_tgid();
     u32 pid = tgid_pid & 0xffffffff;
+
     /* Stack size is limited, so we cannot store a struct sock on the stack. */
     int idx = 0;
     ampnf_sock_buf_t *zeroed_sock_buf = zeroed_sock_buf_arr.lookup(&idx);
@@ -221,12 +253,14 @@ static int _getsockinfo(struct sock *sk,
             goto done;
         }
     }
+
     if (sock_buf->inet_sk.sk.sk_protocol != IPPROTO_TCP && sock_buf->inet_sk.sk.sk_protocol != IPPROTO_UDP) {
         /* socket is not TCPv4, UDPv4, TCPv6 or UDPv6 */
         ret = -EINVAL;
         goto done;
     }
     *protocol = sock_buf->inet_sk.sk.sk_protocol;
+
     if (sock_buf->inet_sk.sk.sk_family == PF_INET) {
         rc = _do_inet_getname(&sock_buf->inet_sk.sk, (struct sockaddr *)sock_name, 0);
         if (rc < 0) {
@@ -253,11 +287,13 @@ static int _getsockinfo(struct sock *sk,
     } else {
         *connected = 1;
     }
+
     ret = 0;
 done:
     sock_bufs.delete(&pid);
     return ret;
 }
+
 /* TCP connect/accept: create && overwrite
  * TCP send: !create && !overwrite
  * UDP send/recv: create && !overwrite
@@ -304,6 +340,7 @@ static ampnf_known_sock_t *_get_known_sock(struct sock *sock, bool create,
     }
     return known_sock;
 }
+
 static bool _addrs_equal(const struct sockaddr *first,
                          const struct sockaddr *second)
 {
@@ -332,6 +369,7 @@ static bool _addrs_equal(const struct sockaddr *first,
     }
     return equal;
 }
+
 static bool _is_loopback(const struct sockaddr *addr)
 {
     bool is_loopback = false;
@@ -364,6 +402,7 @@ static bool _is_loopback(const struct sockaddr *addr)
       ((addr_in6)->sin6_addr.s6_addr32[1] == ipv4_net_in6.s6_addr32[1]) && \
       ((addr_in6)->sin6_addr.s6_addr32[2] == ipv4_net_in6.s6_addr32[2]) && \
       ntohl((addr_in6)->sin6_addr.s6_addr32[3]) == INADDR_ANY))
+
     if (addr->sa_family == AF_INET) {
         is_loopback = (IS_IN_LOOPBACK(((const struct sockaddr_in *)addr)) ||
                        IS_IN_ZERO(((const struct sockaddr_in *)addr)));
@@ -371,10 +410,13 @@ static bool _is_loopback(const struct sockaddr *addr)
         is_loopback = (IS_IN6_LOOPBACK(((const struct sockaddr_in6 *)addr)) ||
                        IS_IN6_ZERO(((const struct sockaddr_in6 *)addr)));
     }
+
     return is_loopback;
 }
+
 /* BPF can't do open-ended loops. */
 #define MAX_IOVEC_ITERS 10
+
 /* Adapted from memcpy_fromiovecend in kernel 3.10 */
 static int _memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
                                 int offset, int len)
@@ -382,6 +424,7 @@ static int _memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
     struct iovec iov_buf;
     int i;
     int ret = 0;
+
     /* Skip over the finished iovecs */
 #pragma unroll MAX_IOVEC_ITERS
     for (i = 0; i < MAX_IOVEC_ITERS; i++) {
@@ -398,6 +441,7 @@ static int _memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
     if (offset >= iov_buf.iov_len) {
         return 0;
     }
+
     /** @todo TODO: the &= trick doesn't work when MAX_IOVEC_ITERS > 1 */
 #pragma unroll MAX_IOVEC_ITERS
     for (i = 0; i < 1; i++) {
@@ -405,8 +449,10 @@ static int _memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
             if (bpf_probe_read(&iov_buf, sizeof(iov_buf), iov)) {
                 break;
             }
+
             u8 __user *base = iov_buf.iov_base + offset;
             int copy = min_t(unsigned int, len, iov_buf.iov_len - offset);
+
             offset = 0;
             /* The &= is here to convince BPF we're not doing an unbounded read.
              * For this to work, AMPNF_TCP_SEND_LIMIT MUST be a power of 2. */
@@ -424,16 +470,19 @@ static int _memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
     }
     return ret;
 }
+
 static bool _populate_process_info(ebpf_network_kernel_event_t *event)
 {
     u64 tgid_pid = bpf_get_current_pid_tgid();
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     u32 pid = tgid_pid >> 32;
+
     pid_t *exclude_pid = excluded_pids.lookup(&pid);
     if (exclude_pid) {
         return false;
     }
     event->pid = pid;
+
     // Although cred and real_cred are available in task.
     // They seem to contain the same values for uid and euid.
     event->user.ruid = task->cred->uid.val;
@@ -442,8 +491,10 @@ static bool _populate_process_info(ebpf_network_kernel_event_t *event)
     event->parent_user.ruid = task->real_parent->cred->uid.val;
     event->parent_user.euid = task->real_parent->cred->euid.val;
     event->parent_user.gid = task->real_parent->cred->gid.val;
+
     return true;
 }
+
 int inet_stream_connect_probe(struct pt_regs *ctx, struct socket *sock,
                               struct sockaddr *uaddr, int addr_len, int flags)
 {
@@ -457,6 +508,7 @@ int inet_stream_connect_probe(struct pt_regs *ctx, struct socket *sock,
     if (!_populate_process_info(&event)) {
         return 0;
     }
+
     if (!bpf_probe_read(&socket_buf, sizeof(socket_buf), sock)) {
         ampnf_known_sock_t *known_sock = _get_known_sock(socket_buf.sk, true, true, AMPNF_TYPE_TCP_CLI);
         if (known_sock) {
@@ -479,6 +531,7 @@ int inet_stream_connect_probe(struct pt_regs *ctx, struct socket *sock,
     }
     return 0;
 }
+
 struct sock *inet_csk_accept_retprobe(struct pt_regs *ctx)
 {
     struct sock *sk = (struct sock *)PT_REGS_RC(ctx);
@@ -489,6 +542,7 @@ struct sock *inet_csk_accept_retprobe(struct pt_regs *ctx)
     if (!_populate_process_info(&event)) {
         return 0;
     }
+
     ampnf_known_sock_t *known_sock = _get_known_sock(sk, true, true, AMPNF_TYPE_TCP_SRV);
     if (known_sock) {
         int connected;
@@ -503,10 +557,12 @@ struct sock *inet_csk_accept_retprobe(struct pt_regs *ctx)
     }
     return 0;
 }
+
 static void _process_tcp_sendmsg(struct pt_regs *ctx, struct sock *sk,
                                  struct msghdr *msg, size_t size, u64 timestamp_ns)
 {
     ampnf_known_sock_t *known_sock = _get_known_sock(sk, false, false, AMPNF_TYPE_NONE);
+
     if (known_sock && known_sock->type == AMPNF_TYPE_TCP_CLI) {
         int idx = 0;
         ebpf_network_payload_kernel_event_t *zeroed_payload_event = zeroed_payload_event_arr.lookup(&idx);
@@ -579,6 +635,7 @@ static void _process_tcp_sendmsg(struct pt_regs *ctx, struct sock *sk,
         }
     }
 }
+
 static void _process_udp_sendmsg(struct pt_regs *ctx, struct sock *sk,
                                  struct msghdr *msg, size_t size, u64 timestamp_ns)
 {
@@ -588,9 +645,11 @@ static void _process_udp_sendmsg(struct pt_regs *ctx, struct sock *sk,
         .timestamp_ns = timestamp_ns,
     };
     bool do_send_event = false;
+
     if (!_populate_process_info(&event)) {
         return;
     }
+
     ampnf_known_sock_t *known_sock = _get_known_sock(sk, true, false, AMPNF_TYPE_UDP);
     if (known_sock) {
         int connected;
@@ -623,6 +682,7 @@ static void _process_udp_sendmsg(struct pt_regs *ctx, struct sock *sk,
         events.perf_submit(ctx, &event, sizeof(event));
     }
 }
+
 int inet_sendmsg_probe(struct pt_regs *ctx,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
                        struct kiocb *iocb,
@@ -632,6 +692,7 @@ int inet_sendmsg_probe(struct pt_regs *ctx,
 {
     u64 timestamp_ns = bpf_ktime_get_ns();
     struct socket socket_buf;
+
     if (!bpf_probe_read(&socket_buf, sizeof(socket_buf), sock)) {
         if (socket_buf.type == SOCK_DGRAM) {
             _process_udp_sendmsg(ctx, socket_buf.sk, msg, size, timestamp_ns);
@@ -641,30 +702,36 @@ int inet_sendmsg_probe(struct pt_regs *ctx,
     }
     return 0;
 }
+
 static void _process_recvmsg(struct pt_regs *ctx, struct sock *sk, ampnf_known_sock_type_t sock_type, u64 timestamp_ns)
 {
     ebpf_network_kernel_event_t event = {
         .event_type = ebpf_network_kernel_event_type_receive,
         .timestamp_ns = timestamp_ns,
     };
+
     if (!_populate_process_info(&event)) {
         return;
     }
+
     ampnf_known_sock_t *known_sock = _get_known_sock(sk, true, false, sock_type);
     if (known_sock) {
         int connected;
         if ((!_getsockinfo(sk, &event.local, &event.remote, &event.protocol, &connected)) &&
             (!_is_loopback((struct sockaddr *)&event.remote))) {
             bool do_send_event = false;
+
             if (!_addrs_equal((struct sockaddr *)&event.local, (struct sockaddr *)&known_sock->last_local)) {
                 do_send_event = true;
                 known_sock->last_local = event.local;
             }
+
             if (!_addrs_equal((struct sockaddr *)&event.remote, 
             (struct sockaddr *)&known_sock->last_remote)) {
                 do_send_event = true;
                 known_sock->last_remote = event.remote;
             }
+
             /* For a unique connection, only the first data packet triggers an event. */
             if (do_send_event) {
                 event.sk_id = known_sock->sk_id;
@@ -674,6 +741,7 @@ static void _process_recvmsg(struct pt_regs *ctx, struct sock *sk, ampnf_known_s
         }
     }
 }
+
 int inet_recvmsg_probe(struct pt_regs *ctx,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
                        struct kiocb *iocb,
@@ -685,6 +753,7 @@ int inet_recvmsg_probe(struct pt_regs *ctx,
 {
     u64 timestamp_ns = bpf_ktime_get_ns();
     struct socket socket_buf;
+
     if (!bpf_probe_read(&socket_buf, sizeof(socket_buf), sock)) {
         if (socket_buf.type == SOCK_DGRAM) {
             _process_recvmsg(ctx, socket_buf.sk, AMPNF_TYPE_UDP, timestamp_ns);
@@ -694,12 +763,14 @@ int inet_recvmsg_probe(struct pt_regs *ctx,
     }
     return 0;
 }
+
 int release_probe(struct pt_regs *ctx, struct socket *sock)
 {
     ebpf_network_kernel_event_t event = {
         .event_type = ebpf_network_kernel_event_type_release,
         .timestamp_ns = bpf_ktime_get_ns(),
     };
+
     if (!_populate_process_info(&event)) {
         return 0;
     }
@@ -719,6 +790,7 @@ int release_probe(struct pt_regs *ctx, struct socket *sock)
     }
     return 0;
 }
+
 int inet_listen_probe(struct pt_regs *ctx, struct socket *sock, int backlog)
 {
     struct socket socket_buf;
@@ -726,9 +798,11 @@ int inet_listen_probe(struct pt_regs *ctx, struct socket *sock, int backlog)
         .event_type = ebpf_network_kernel_event_type_listen,
         .timestamp_ns = bpf_ktime_get_ns(),
     };
+
     if (!_populate_process_info(&event)) {
         return 0;
     }
+
     if (!bpf_probe_read(&socket_buf, sizeof(socket_buf), sock)) {
         ampnf_known_sock_t *known_sock = _get_known_sock(socket_buf.sk, true, false, AMPNF_TYPE_TCP_CLI);
         if (known_sock) {
