@@ -1,18 +1,3 @@
-/**
- * @file
- * @copyright (c) 2020-2023 Cisco Systems, Inc. All rights reserved
- *
- * SPDX-License-Identifier: LGPL-2.1-or-later
- * This library is free software; you can redistribute it and/or modify it under the
- * terms of the GNU Lesser General Public License as published by the Free Software
- * Foundation; either version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
- * PARTICULAR PURPOSE. See the GNU Lesser General Public License or the LICENSE file for more details.
- */
-
-
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/fdtable.h>
@@ -1034,5 +1019,40 @@ int vfs_link_probe(struct pt_regs *ctx,
         }
     }
 
+    return 0;
+}
+
+int __fput_probe(struct pt_regs *ctx, struct file *file)
+{
+    u64 timestamp_ns = bpf_ktime_get_ns();
+    u64 tgid_kpid = bpf_get_current_pid_tgid();
+    u32 tgid = tgid_kpid >> 32;
+
+    if (exclude_tgid(tgid)) {
+        return 0;
+    }
+
+    const struct path *path = &file->f_path;
+    if (file->f_mode & FMODE_WRITE && _want_inode(path->dentry->d_inode)) {
+        int idx = 0;
+        int zero = 0;
+        ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
+        /* BPF enforces that we check if zeroed_event is NULL */
+        if (zeroed_event) {
+            ebpf_path_event_t *event;
+            u32 kpid = tgid_kpid & 0xffffffff;
+
+            loop_event_p.update(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
+            if (event) {
+                event->event_info.timestamp_ns = timestamp_ns;
+                event->event_info.fn = EBPF_FN_FILE_CLOSE_WRITE;
+                event->event_info.tgid = tgid;
+                _set_dentry_event(path->dentry->d_inode, path->dentry, &event->event_info);
+                path_lookup_depth.update(&idx, &zero); // reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
+            }
+        }
+    }
     return 0;
 }
