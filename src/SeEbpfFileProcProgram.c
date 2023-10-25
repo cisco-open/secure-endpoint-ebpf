@@ -73,6 +73,7 @@ typedef enum ebpf_proc_file_fn {
     EBPF_FN_FILE_CLOSE_WRITE,
     EBPF_FN_FILE_UNLINK,
     EBPF_FN_VFS_READ,
+    EBPF_FN_DO_MMAP,
 
     EBPF_FN_PROC_FORK,
     EBPF_FN_PROC_EXEC,
@@ -132,6 +133,12 @@ typedef struct dentry_pointer {
     struct dentry *first_dentry;
 } dentry_pointer_t;
 
+typedef struct do_mmap_exclusion_key {
+    unsigned int dev_major;
+    unsigned int dev_minor;
+    ino_t ino;
+} do_mmap_exclusion_key_t;
+
 /* Use a BPF map as the stack is too small to hold ebpf_path_event_t */
 BPF_ARRAY(zeroed_path_event_arr, ebpf_path_event_t, 1);
 
@@ -165,6 +172,8 @@ BPF_PROG_ARRAY(programs_table, 4);
  * since it is persistent between probes/programs */
 BPF_PERCPU_ARRAY(path_lookup_depth, int, 1);
 
+BPF_TABLE("extern", do_mmap_exclusion_key_t, u32, do_mmap_exclusions, 4);
+
 BPF_PERF_OUTPUT(events);
 
 
@@ -173,12 +182,23 @@ static bool exclude_tgid(u32 tgid)
     return excluded_pids.lookup(&tgid);
 }
 
+static bool is_excluded_do_mmap(dev_t dev, ino_t ino)
+{
+    do_mmap_exclusion_key_t key = { MAJOR(dev), MINOR(dev), ino };
+    return do_mmap_exclusions.lookup(&key);
+}
+
 static bool _want_inode(struct inode *inode)
 {
     unsigned int magic = inode->i_sb->s_magic;
     unsigned int mode = inode->i_mode;
     return (magic != PROC_SUPER_MAGIC && magic != SYSFS_MAGIC && magic != CGROUP_SUPER_MAGIC &&
             (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)));
+}
+
+static bool _is_executable_memory_map(unsigned long prot)
+{
+    return (prot & PROT_EXEC);
 }
 
 /* path dentry lookup */
@@ -996,6 +1016,50 @@ int vfs_read_probe(struct pt_regs *ctx,
     return 0;
 }
 
+int do_mmap_probe(struct pt_regs *ctx,
+                  struct file *file,
+                  unsigned long addr,
+                  unsigned long len,
+                  unsigned long prot,
+                  unsigned long flags)
+{
+    u64 timestamp_ns = bpf_ktime_get_ns();
+    u64 tgid_pid = bpf_get_current_pid_tgid();
+    u32 tgid = tgid_pid >> 32;
+    if (exclude_tgid(tgid)) {
+        return 0;
+    }
+
+    struct inode *dir = file->f_inode;
+    struct dentry *dentry = file->f_path.dentry;
+    if (is_excluded_do_mmap(dir->i_sb->s_dev, dir->i_ino)) {
+        return 0;
+    }
+
+    if (_is_executable_memory_map(prot) && _want_inode(dir)) {
+        int idx = 0;
+        int zero = 0;
+        ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
+        /* BPF enforces that we check if zeroed_event is NULL */
+        if (zeroed_event) {
+            ebpf_path_event_t *event;
+            u32 kpid = tgid_pid & 0xffffffff;
+
+            loop_event_p.update(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
+            if (event) {
+                event->event_info.timestamp_ns = timestamp_ns;
+                event->event_info.fn = EBPF_FN_DO_MMAP;
+                event->event_info.tgid = tgid;
+                _set_dentry_event(dir, dentry, &event->event_info);
+                path_lookup_depth.update(&idx, &zero); // reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
+            }
+        }
+    }
+    return 0;
+}
+
 int vfs_link_probe(struct pt_regs *ctx,
                    struct dentry *old_dentry,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
@@ -1034,5 +1098,40 @@ int vfs_link_probe(struct pt_regs *ctx,
         }
     }
 
+    return 0;
+}
+
+int __fput_probe(struct pt_regs *ctx, struct file *file)
+{
+    u64 timestamp_ns = bpf_ktime_get_ns();
+    u64 tgid_kpid = bpf_get_current_pid_tgid();
+    u32 tgid = tgid_kpid >> 32;
+
+    if (exclude_tgid(tgid)) {
+        return 0;
+    }
+
+    const struct path *path = &file->f_path;
+    if (file->f_mode & FMODE_WRITE && _want_inode(path->dentry->d_inode)) {
+        int idx = 0;
+        int zero = 0;
+        ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
+        /* BPF enforces that we check if zeroed_event is NULL */
+        if (zeroed_event) {
+            ebpf_path_event_t *event;
+            u32 kpid = tgid_kpid & 0xffffffff;
+
+            loop_event_p.update(&idx, zeroed_event);
+            event = loop_event_p.lookup(&idx);
+            if (event) {
+                event->event_info.timestamp_ns = timestamp_ns;
+                event->event_info.fn = EBPF_FN_FILE_CLOSE_WRITE;
+                event->event_info.tgid = tgid;
+                _set_dentry_event(path->dentry->d_inode, path->dentry, &event->event_info);
+                path_lookup_depth.update(&idx, &zero); // reset tail depth
+                programs_table.call(ctx, PATH_LOOP_PROG);
+            }
+        }
+    }
     return 0;
 }
