@@ -591,7 +591,7 @@ static void _process_tcp_sendmsg(struct pt_regs *ctx,
                     }
                     struct iovec iov_buf;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-                    if ((iov_iter_rw(&msg_buf.msg_iter) == WRITE) && iter_is_iovec(&msg_buf.msg_iter) &&
+                    if ((iov_iter_rw(&msg_buf.msg_iter) == WRITE) && user_backed_iter(&msg_buf.msg_iter) &&
                         (!bpf_probe_read(&iov_buf, sizeof(iov_buf), iter_iov(&msg_buf.msg_iter))) &&
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
                     if (msg_buf.msg_iter.data_source && (msg_buf.msg_iter.iter_type == ITER_IOVEC) &&
