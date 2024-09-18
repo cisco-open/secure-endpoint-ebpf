@@ -1,6 +1,6 @@
 /**
  * @file
- * @copyright (c) 2020-2023 Cisco Systems, Inc. All rights reserved
+ * @copyright (c) 2020-2024 Cisco Systems, Inc. All rights reserved
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  * This library is free software; you can redistribute it and/or modify it under the
@@ -17,6 +17,7 @@
 #include <linux/dcache.h>
 #include <linux/fdtable.h>
 #include <linux/fs_struct.h>
+#include <linux/init_task.h>
 #include <linux/limits.h>
 #include <linux/magic.h>
 #include <linux/mm.h>
@@ -26,6 +27,9 @@
 #include <uapi/linux/fcntl.h>
 #include <uapi/linux/mman.h>
 #include <uapi/linux/ptrace.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+#include <linux/sched/signal.h>
+#endif
 
 /* RHEL macros */
 #ifndef RHEL_RELEASE_VERSION
@@ -90,6 +94,8 @@ typedef struct ebpf_user {
     uid_t ruid;
     uid_t euid;
     gid_t gid;
+    pid_t sid;
+    pid_t pgid;
 } ebpf_event_user_t;
 
 typedef struct ebpf_path_event_info {
@@ -103,6 +109,7 @@ typedef struct ebpf_path_event_info {
     struct dentry *dentry;
     unsigned int path_name_size;
     uint64_t timestamp_ns;
+    int exit_status;
 } ebpf_common_event_info_t;
 
 typedef struct ebpf_rename_event_info {
@@ -132,6 +139,8 @@ typedef struct dentry_pointer {
     struct dentry *first_dentry;
 } dentry_pointer_t;
 
+typedef bool apply_exclusion_child_t;
+
 /* Use a BPF map as the stack is too small to hold ebpf_path_event_t */
 BPF_ARRAY(zeroed_path_event_arr, ebpf_path_event_t, 1);
 
@@ -155,7 +164,7 @@ BPF_HASH(leaf_dentry, u32, struct dentry_pointer);
 /* Monitored proc_*_connector in progress, keyed on thread ID */
 BPF_HASH(proc_connector_calls, u32, ebpf_path_event_t);
 
-BPF_TABLE("extern", pid_t, u32, excluded_pids, EXCLUDED_PIDS_MAX);
+BPF_TABLE("extern", pid_t, apply_exclusion_child_t, excluded_pids, EXCLUDED_PIDS_MAX);
 
 /* Holds FDs of programs */
 BPF_PROG_ARRAY(programs_table, 4);
@@ -167,9 +176,20 @@ BPF_PERCPU_ARRAY(path_lookup_depth, int, 1);
 
 BPF_PERF_OUTPUT(events);
 
-static bool exclude_tgid(u32 tgid)
+static bool exclude_tgid()
 {
-    return excluded_pids.lookup(&tgid);
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    pid_t ppid = task->real_parent->tgid;
+    apply_exclusion_child_t *entry = excluded_pids.lookup(&ppid);
+    if (entry && *entry) {
+        return true;
+    }
+    pid_t pid = task->tgid;
+    if (excluded_pids.lookup(&pid)) {
+        return true;
+    }
+
+    return false;
 }
 
 static bool _want_inode(struct inode *inode)
@@ -178,6 +198,31 @@ static bool _want_inode(struct inode *inode)
     unsigned int mode = inode->i_mode;
     return (magic != PROC_SUPER_MAGIC && magic != SYSFS_MAGIC && magic != CGROUP_SUPER_MAGIC &&
             (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)));
+}
+
+static pid_t _get_pid_struct_data(struct task_struct *task, enum pid_type pid_type)
+{
+    pid_t pid_data;
+
+/* pids[] was removed from task_struct since commit 2c4704756cab7cfa031ada4dab361562f0e357c0 (4.19 mainline
+ * kernel) Use the macro INIT_PID_LINK as a conditional judgment.
+ */
+#ifdef INIT_PID_LINK
+    struct pid_link pid_link_struct;
+    struct pid pid; /* Some older kernels fail if the full pid struct isn't pulled out */
+    bpf_probe_read_kernel(&pid_link_struct, sizeof(pid_link_struct), &task->pids[pid_type]);
+    bpf_probe_read_kernel(&pid, sizeof(pid), pid_link_struct.pid);
+    pid_data = pid.numbers[0].nr; /* Pre-kernel 6.5 pid.numbers[] is always of size 1. */
+#else
+    struct pid *pid_struct;
+    struct upid upid_struct;
+    unsigned int level;
+    bpf_probe_read_kernel(&pid_struct, sizeof(pid_struct), &task->signal->pids[pid_type]);
+    bpf_probe_read_kernel(&level, sizeof(level), &pid_struct->level);
+    bpf_probe_read_kernel(&upid_struct, sizeof(upid_struct), &pid_struct->numbers[level]);
+    pid_data = upid_struct.nr;
+#endif
+    return pid_data;
 }
 
 /* path dentry lookup */
@@ -363,21 +408,31 @@ int rename_lookup_program(void *ctx)
     return 0;
 }
 
-static void _send_path_event(struct pt_regs *ctx, struct task_struct *task, ebpf_path_event_t *event)
+static void _populate_process_info(struct task_struct *task, ebpf_common_event_info_t *event_info)
 {
-    event->event_info.ppid = task->real_parent->tgid;
+    event_info->ppid = task->real_parent->tgid;
 
     // Although cred and real_cred are available in task.
     // They seem to contain the same values for uid and euid.
-    event->event_info.user.ruid = task->cred->uid.val;
-    event->event_info.user.euid = task->cred->euid.val;
-    event->event_info.user.gid = task->cred->gid.val;
-    event->event_info.parent_user.ruid = task->real_parent->cred->uid.val;
-    event->event_info.parent_user.euid = task->real_parent->cred->euid.val;
-    event->event_info.parent_user.gid = task->real_parent->cred->gid.val;
+    event_info->user.ruid = task->cred->uid.val;
+    event_info->user.euid = task->cred->euid.val;
+    event_info->user.gid = task->cred->gid.val;
+    event_info->user.sid = _get_pid_struct_data(task, PIDTYPE_SID);
+    event_info->user.pgid = _get_pid_struct_data(task, PIDTYPE_PGID);
+    event_info->parent_user.ruid = task->real_parent->cred->uid.val;
+    event_info->parent_user.euid = task->real_parent->cred->euid.val;
+    event_info->parent_user.gid = task->real_parent->cred->gid.val;
+    event_info->parent_user.sid = _get_pid_struct_data(task->real_parent, PIDTYPE_SID);
+    event_info->parent_user.pgid = _get_pid_struct_data(task->real_parent, PIDTYPE_PGID);
+}
+
+static void _send_path_event(struct pt_regs *ctx, struct task_struct *task, ebpf_path_event_t *event)
+{
+    _populate_process_info(task, &event->event_info);
 
     /* NULL-out dentry ptr before sending to userland */
     event->event_info.dentry = NULL;
+
     /* Don't send a full ebpf_path_event_t as that would be
      * wasteful. event_size is dependent upon how much of struct
      * is filled and to be sent. */
@@ -389,33 +444,11 @@ static void _send_path_event(struct pt_regs *ctx, struct task_struct *task, ebpf
 
 int end_program(void *ctx)
 {
-
     int idx = 0;
     ebpf_path_event_t *event = (ebpf_path_event_t *)loop_event_p.lookup(&idx);
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     if (event) {
-        event->event_info.ppid = task->real_parent->tgid;
-
-        // Although cred and real_cred are available in task.
-        // They seem to contain the same values for uid and euid.
-        event->event_info.user.ruid = task->cred->uid.val;
-        event->event_info.user.euid = task->cred->euid.val;
-        event->event_info.user.gid = task->cred->gid.val;
-        event->event_info.parent_user.ruid = task->real_parent->cred->uid.val;
-        event->event_info.parent_user.euid = task->real_parent->cred->euid.val;
-        event->event_info.parent_user.gid = task->real_parent->cred->gid.val;
-
-        /* NULL-out dentry ptr before sending to userland */
-        event->event_info.dentry = NULL;
-        /* Don't send a full ebpf_path_event_t as that would be
-         * wasteful. event_size is dependent upon how much of struct
-         * is filled and to be sent. */
-        size_t event_size = sizeof(event->event_info) + event->event_info.path_name_size;
-
-        if (event_size < sizeof(*event)) {
-            events.perf_submit(ctx, event, event_size);
-        }
-
+        _send_path_event(ctx, task, event);
         loop_event_p.delete(&idx);
     }
 
@@ -424,26 +457,17 @@ int end_program(void *ctx)
 
 int rename_end_program(void *ctx)
 {
-
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 kpid = tgid_kpid & 0xffffffff;
 
     ebpf_rename_event_t *event = (ebpf_rename_event_t *)vfs_rename_calls.lookup(&kpid);
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     if (event) {
-        event->path_event_info.ppid = task->real_parent->tgid;
-
-        // Although cred and real_cred are available in task.
-        // They seem to contain the same values for uid and euid.
-        event->path_event_info.user.ruid = task->cred->uid.val;
-        event->path_event_info.user.euid = task->cred->euid.val;
-        event->path_event_info.user.gid = task->cred->gid.val;
-        event->path_event_info.parent_user.ruid = task->real_parent->cred->uid.val;
-        event->path_event_info.parent_user.euid = task->real_parent->cred->euid.val;
-        event->path_event_info.parent_user.gid = task->real_parent->cred->gid.val;
+        _populate_process_info(task, &event->path_event_info);
 
         /* NULL-out dentry ptr before sending to userland */
         event->path_event_info.dentry = NULL;
+
         /* Don't send a full ebpf_path_event_t as that would be
          * wasteful. event_size is dependent upon how much of struct
          * is filled and to be sent. */
@@ -482,11 +506,16 @@ static void _set_from_mount_info(struct inode *inode, ebpf_rename_event_t *event
     _set_mount_info(inode, &event->event_info.from_mount_info);
 }
 
-int proc_fork_connector_probe(struct pt_regs *ctx, struct task_struct *task)
+int wake_up_new_task_probe(struct pt_regs *ctx, struct task_struct *task)
 {
     u64 timestamp_ns = bpf_ktime_get_ns();
     u32 kpid = task->pid;
     u32 tgid = task->tgid;
+
+    if (task->flags & PF_KTHREAD) {
+        // Don't monitor kernel threads
+        return 0;
+    }
 
     /* Only monitor new processes, not new threads */
     if (kpid == tgid) {
@@ -541,29 +570,33 @@ int proc_exec_connector_probe(struct pt_regs *ctx, struct task_struct *task)
     return 0;
 }
 
-int proc_exit_connector_probe(struct pt_regs *ctx, struct task_struct *task)
+int acct_process_probe(struct pt_regs *ctx)
 {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (task->flags & PF_KTHREAD) {
+        // Don't monitor kernel threads
+        return 0;
+    }
     u64 timestamp_ns = bpf_ktime_get_ns();
 
     /* Only monitor process exits, not thread exits */
-    if (task->pid == task->tgid) {
-        int idx = 0;
-        ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
-        /* BPF enforces that we check if zeroed_event is NULL */
-        if (zeroed_event) {
-            ebpf_path_event_t *event;
-            u32 kpid = task->pid;
+    int idx = 0;
+    ebpf_path_event_t *zeroed_event = zeroed_path_event_arr.lookup(&idx);
+    /* BPF enforces that we check if zeroed_event is NULL */
+    if (zeroed_event) {
+        ebpf_path_event_t *event;
+        u32 kpid = task->pid;
 
-            proc_connector_calls.insert(&kpid, zeroed_event);
-            event = proc_connector_calls.lookup(&kpid);
-            if (event) {
-                event->event_info.timestamp_ns = timestamp_ns;
-                event->event_info.tgid = task->tgid;
-                event->event_info.fn = EBPF_FN_PROC_EXIT;
-                _send_path_event(ctx, task, event);
-            }
-            proc_connector_calls.delete(&kpid);
+        proc_connector_calls.insert(&kpid, zeroed_event);
+        event = proc_connector_calls.lookup(&kpid);
+        if (event) {
+            event->event_info.timestamp_ns = timestamp_ns;
+            event->event_info.tgid = task->tgid;
+            event->event_info.fn = EBPF_FN_PROC_EXIT;
+            event->event_info.exit_status = task->exit_code;
+            _send_path_event(ctx, task, event);
         }
+        proc_connector_calls.delete(&kpid);
     }
 
     return 0;
@@ -578,7 +611,7 @@ static int _rename_probe_helper(struct pt_regs *ctx,
     u64 timestamp_ns = bpf_ktime_get_ns();
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_kpid >> 32;
-    if (exclude_tgid(tgid)) {
+    if (exclude_tgid()) {
         return 0;
     }
 
@@ -709,7 +742,7 @@ int vfs_write_probe(struct pt_regs *ctx, struct file *file, const char *buf, siz
     u64 timestamp_ns = bpf_ktime_get_ns();
     u64 tgid_pid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_pid >> 32;
-    if (exclude_tgid(tgid)) {
+    if (exclude_tgid()) {
         return 0;
     }
 
@@ -762,7 +795,7 @@ int do_truncate_probe(struct pt_regs *ctx,
     u64 timestamp_ns = bpf_ktime_get_ns();
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_kpid >> 32;
-    if (exclude_tgid(tgid)) {
+    if (exclude_tgid()) {
         return 0;
     }
 
@@ -802,7 +835,7 @@ int vfs_unlink_probe(struct pt_regs *ctx,
     u64 timestamp_ns = bpf_ktime_get_ns();
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_kpid >> 32;
-    if (exclude_tgid(tgid)) {
+    if (exclude_tgid()) {
         return 0;
     }
 
@@ -852,7 +885,7 @@ int vfs_open_probe(struct pt_regs *ctx, const struct path *path, struct file *fi
 
         u64 tgid_kpid = bpf_get_current_pid_tgid();
         u32 tgid = tgid_kpid >> 32;
-        if (exclude_tgid(tgid)) {
+        if (exclude_tgid()) {
             return 0;
         }
 
@@ -900,7 +933,7 @@ int vfs_symlink_probe(struct pt_regs *ctx,
     u64 timestamp_ns = bpf_ktime_get_ns();
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_kpid >> 32;
-    if (exclude_tgid(tgid)) {
+    if (exclude_tgid()) {
         return 0;
     }
 
@@ -954,7 +987,7 @@ int vfs_read_probe(struct pt_regs *ctx,
     u64 timestamp_ns = bpf_ktime_get_ns();
     u64 tgid_pid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_pid >> 32;
-    if (exclude_tgid(tgid)) {
+    if (exclude_tgid()) {
         return 0;
     }
 
@@ -1007,7 +1040,7 @@ int vfs_link_probe(struct pt_regs *ctx,
     u64 timestamp_ns = bpf_ktime_get_ns();
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_kpid >> 32;
-    if (exclude_tgid(tgid)) {
+    if (exclude_tgid()) {
         return 0;
     }
 
@@ -1042,7 +1075,7 @@ int __fput_probe(struct pt_regs *ctx, struct file *file)
     u64 tgid_kpid = bpf_get_current_pid_tgid();
     u32 tgid = tgid_kpid >> 32;
 
-    if (exclude_tgid(tgid)) {
+    if (exclude_tgid()) {
         return 0;
     }
 

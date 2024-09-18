@@ -2,8 +2,8 @@
 
 This repo contains the network, file, and process monitoring eBPF programs used by the Cisco Secure Endpoint linux connector to detect various events on the system.
 
-- [FileProc](src/SeEbpfFileProcProgram.c) tracks file and process information
-- [NetworkMonitor](src/SeEbpfNetworkMonitorProgram.c) tracks various networking events
+- [FileProc](bcc/SeEbpfFileProcProgram.c) tracks file and process information
+- [NetworkMonitor](bcc/SeEbpfNetworkMonitorProgram.c) tracks various networking events
 
 For more information about Cisco Secure Endpoint please visit the product page [here](https://www.cisco.com/site/us/en/products/security/endpoint-security/secure-endpoint/index.html).
 
