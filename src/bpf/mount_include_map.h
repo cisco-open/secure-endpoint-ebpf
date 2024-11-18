@@ -40,10 +40,13 @@ static_inline bool is_from_remote_filesystem(long unsigned int magic)
     return false;
 }
 
-static_inline bool is_monitored_network_drive_file(const struct inode *inode)
+static_inline bool is_monitored_network_drive_file(const struct inode *inode, bpf_file_path_flags_t *flags)
 {
     const long unsigned int magic = BPF_CORE_READ(inode, i_sb, s_magic);
+    flags->path_scannable = false;
+
     if (!is_from_remote_filesystem(magic)) {
+        flags->path_scannable = true;
         return true;
     }
 
@@ -54,29 +57,41 @@ static_inline bool is_monitored_network_drive_file(const struct inode *inode)
         if (*scannable_remote_mount == false || !network_drive_scanning) {
             return false;
         }
+        flags->path_scannable = true;
     }
     return true;
 }
 
-static_inline bool is_monitored_network_drive_exe(const struct inode *inode)
+static_inline bool is_monitored_network_drive_exe(const struct inode *inode, bpf_file_path_flags_t *flags)
 {
     const long unsigned int magic = BPF_CORE_READ(inode, i_sb, s_magic);
+    flags->path_scannable = false;
     if (!is_from_remote_filesystem(magic)) {
+        flags->path_scannable = true;
         return true;
     }
 
     const u32 dev = BPF_CORE_READ(inode, i_sb, s_dev);
     const bool *scannable_remote_mount = bpf_map_lookup_elem(&remote_mounts, &dev);
+    if (scannable_remote_mount) {
+        // false == remote nfs hard mount, true == scannable remote mount
+        if (*scannable_remote_mount == false) {
+            return false;
+        }
+        flags->path_scannable = true;
+    }
 
-    // false == remote nfs hard mount, true == scannable remote mount
-    return !(scannable_remote_mount && *scannable_remote_mount == false);
+    return true;
 }
 
-static_inline bool is_monitored_network_drive_exes(const struct task_struct *task)
+static_inline bool is_monitored_network_drive_exes(const struct task_struct *task,
+                                                   bpf_file_path_flags_t *child_flags,
+                                                   bpf_file_path_flags_t *parent_flags)
 {
     const struct inode *inode = BPF_CORE_READ(task, mm, exe_file, f_path.dentry, d_inode);
     const struct inode *parent_inode =
         BPF_CORE_READ(task, real_parent, mm, exe_file, f_path.dentry, d_inode);
 
-    return is_monitored_network_drive_exe(inode) && is_monitored_network_drive_exe(parent_inode);
+    return is_monitored_network_drive_exe(inode, child_flags) &&
+           is_monitored_network_drive_exe(parent_inode, parent_flags);
 }

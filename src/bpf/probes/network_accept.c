@@ -39,8 +39,16 @@ struct {
 SEC("kretprobe/inet_csk_accept")
 int BPF_KRETPROBE(kretprobe_inet_csk_accept)
 {
+    const u32 zero = 0;
+    struct bpf_network_accept_event *event = bpf_map_lookup_elem(&heap_network_accept_event, &zero);
+    if (!event) {
+        return 0;
+    }
+
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (!is_monitored_network_drive_exes(task)) {
+    if (!is_monitored_network_drive_exes(task,
+                                         &event->buf.exe_path_attributes.flags,
+                                         &event->buf.parent_exe_path_attributes.flags)) {
         return 0;
     }
 
@@ -53,11 +61,6 @@ int BPF_KRETPROBE(kretprobe_inet_csk_accept)
         return 0;
     }
 
-    const u32 zero = 0;
-    struct bpf_network_accept_event *event = bpf_map_lookup_elem(&heap_network_accept_event, &zero);
-    if (!event) {
-        return 0;
-    }
     event->common.operation = bpf_operation_network_accept;
     event->common.ktime = bpf_ktime_get_ns();
     event->current.pid = BPF_CORE_READ(task, tgid);

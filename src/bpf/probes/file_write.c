@@ -35,15 +35,14 @@ struct {
 
 static_inline int send_path_write_event(void *ctx, const struct path *path)
 {
-    const struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    const struct dentry *dentry = BPF_CORE_READ(path, dentry);
-    if (should_filter_accessed_file(task, dentry, bpf_operation_file_write)) {
-        return 0;
-    }
-
     const u32 zero = 0;
     struct bpf_file_write_event *event = bpf_map_lookup_elem(&heap_file_write_event, &zero);
     if (!event) {
+        return 0;
+    }
+    const struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    const struct dentry *dentry = BPF_CORE_READ(path, dentry);
+    if (should_filter_accessed_file(task, dentry, bpf_operation_file_write, &event->buf)) {
         return 0;
     }
 

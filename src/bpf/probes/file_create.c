@@ -41,7 +41,10 @@ static_inline int send_file_create_event(void *ctx, const struct inode *inode, c
     }
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (!is_monitored_network_drive_file(inode) || !is_monitored_network_drive_exes(task)) {
+    if (!is_monitored_network_drive_file(inode, &event->buf.file_path_attributes.flags) ||
+        !is_monitored_network_drive_exes(task,
+                                         &event->buf.exe_path_attributes.flags,
+                                         &event->buf.parent_exe_path_attributes.flags)) {
         return 0;
     }
 

@@ -39,8 +39,16 @@ struct {
 SEC("kprobe/security_socket_listen")
 int BPF_KPROBE(kprobe_security_socket_listen, struct socket *sock, int backlog)
 {
+    const u32 zero = 0;
+    struct bpf_network_listen_event *event = bpf_map_lookup_elem(&heap_network_listen_event, &zero);
+    if (!event) {
+        return 0;
+    }
+
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (!is_monitored_network_drive_exes(task)) {
+    if (!is_monitored_network_drive_exes(task,
+                                         &event->buf.exe_path_attributes.flags,
+                                         &event->buf.parent_exe_path_attributes.flags)) {
         return 0;
     }
 
@@ -53,11 +61,6 @@ int BPF_KPROBE(kprobe_security_socket_listen, struct socket *sock, int backlog)
         return 0;
     }
 
-    const u32 zero = 0;
-    struct bpf_network_listen_event *event = bpf_map_lookup_elem(&heap_network_listen_event, &zero);
-    if (!event) {
-        return 0;
-    }
     event->common.operation = bpf_operation_network_listen;
     event->common.ktime = bpf_ktime_get_ns();
     event->current.pid = BPF_CORE_READ(task, tgid);

@@ -71,19 +71,16 @@ struct file_path_cache_map {
 
 static_inline void init_bpf_file_path_attributes(bpf_file_path_attributes_t *attributes)
 {
+    // Path scannable flag is set early, save results
+    bool tmp_path_scannable = attributes->flags.path_scannable;
     __builtin_memset(&attributes->flags, 0, sizeof(attributes->flags));
+    attributes->flags.path_scannable = tmp_path_scannable;
 }
 
 static_inline void populate_path_from_specialfs(bpf_file_path_flags_t *flags, const struct inode *inode)
 {
     const long unsigned int magic = BPF_CORE_READ(inode, i_sb, s_magic);
     flags->path_from_specialfs = is_from_special_filesystem_type(magic);
-}
-
-static_inline void populate_path_from_remotefs(bpf_file_path_flags_t *flags, const struct inode *inode)
-{
-    const long unsigned int magic = BPF_CORE_READ(inode, i_sb, s_magic);
-    flags->path_from_remotefs = is_from_remote_filesystem(magic);
 }
 
 static_inline void populate_file_mount(struct bpf_mount *mount, const struct inode *inode)
@@ -160,7 +157,6 @@ static_inline size_t get_path_str_from_path(file_path_reference_t *file_path_ref
 
     size_t offset = HALF_PERCPU_FILE_PATH_ARRAY_SIZE;
 
-#pragma unroll
     for (int i = 0; i < MAX_PATH_COMPONENTS; i++) {
 
         const struct dentry *mnt_root = BPF_CORE_READ(vfsmnt, mnt_root);
@@ -210,7 +206,6 @@ static_inline size_t get_path_str_from_path(file_path_reference_t *file_path_ref
 
     const struct inode *inode = BPF_CORE_READ(path, dentry, d_inode);
     populate_path_from_specialfs(&file_path_ref->attributes->flags, inode);
-    populate_path_from_remotefs(&file_path_ref->attributes->flags, inode);
 
     return (length < 0) ? 0 : length;
 }
@@ -226,7 +221,7 @@ static_inline size_t get_path_str_from_dentry(file_path_reference_t *file_path_r
     }
 
     size_t offset = HALF_PERCPU_FILE_PATH_ARRAY_SIZE;
-#pragma unroll
+
     for (int i = 0; i < MAX_PATH_COMPONENTS; i++) {
         const struct dentry *dentry_parent = BPF_CORE_READ(dentry, d_parent);
         if (is_root_dentry(dentry)) {
@@ -257,7 +252,6 @@ static_inline size_t get_path_str_from_dentry(file_path_reference_t *file_path_r
 
     const struct inode *inode = BPF_CORE_READ(dentry, d_inode);
     populate_path_from_specialfs(&file_path_ref->attributes->flags, inode);
-    populate_path_from_remotefs(&file_path_ref->attributes->flags, inode);
     populate_file_mount(&file_path_ref->attributes->mount, inode);
 
     return (length < 0) ? 0 : length;
