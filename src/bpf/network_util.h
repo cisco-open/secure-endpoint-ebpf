@@ -229,7 +229,7 @@ static_inline bool sockaddr_equal(const struct sockaddr *addr1, const struct soc
 static_inline bool is_supported_protocol(struct sock *sk)
 {
     const u16 protocol = socket_protocol(sk);
-    switch (protocol) {
+        switch (protocol) {
         case IPPROTO_IP: // Dummy protocol for TCP. Can be valid, need to check sock family and type.
         case IPPROTO_IPV6:
         case IPPROTO_TCP:
@@ -246,7 +246,7 @@ static_inline bool is_monitored_socket_type(struct sock *sk)
     const u16 type = socket_type(sk);
     switch (type) {
         case SOCK_STREAM: // stream (connection) socket
-        case SOCK_DGRAM:  // datagram (conn.less) socket
+        case SOCK_DGRAM: // datagram (conn.less) socket
             break;
         default:
             return false; // Not supported.

@@ -41,19 +41,24 @@ int BPF_KPROBE(kprobe_security_inode_rename,
                struct dentry *new_dentry,
                unsigned int flags)
 {
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (!is_monitored(old_dentry) || !is_monitored_network_drive_file(old_dir) ||
-        !is_monitored_network_drive_exes(task)) {
-        return 0;
-    }
-
-    if (exclude_tgid(task)) {
-        return 0;
-    }
-
     const u32 zero = 0;
     struct bpf_file_rename_event *event = bpf_map_lookup_elem(&heap_file_rename_event, &zero);
     if (!event) {
+        return 0;
+    }
+
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!is_monitored(old_dentry) ||
+        !is_monitored_network_drive_file(old_dir, &event->buf.old_file_path_attributes.flags) ||
+        !is_monitored_network_drive_exes(task,
+                                         &event->buf.exe_path_attributes.flags,
+                                         &event->buf.parent_exe_path_attributes.flags)) {
+        return 0;
+    }
+
+    event->buf.file_path_attributes.flags = event->buf.old_file_path_attributes.flags;
+
+    if (exclude_tgid(task)) {
         return 0;
     }
 

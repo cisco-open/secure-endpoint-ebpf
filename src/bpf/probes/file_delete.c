@@ -53,13 +53,16 @@ int BPF_KPROBE(kprobe_security_inode_unlink, struct inode *dir, struct dentry *d
         return 0;
     }
 
-    if (!is_monitored_network_drive_file(dir) || !is_monitored_network_drive_exes(task)) {
-        return 0;
-    }
-
     const u32 zero = 0;
     struct bpf_file_delete_event *event = bpf_map_lookup_elem(&heap_file_delete_event, &zero);
     if (!event) {
+        return 0;
+    }
+
+    if (!is_monitored_network_drive_file(dir, &event->buf.file_path_attributes.flags) ||
+        !is_monitored_network_drive_exes(task,
+                                         &event->buf.exe_path_attributes.flags,
+                                         &event->buf.parent_exe_path_attributes.flags)) {
         return 0;
     }
 

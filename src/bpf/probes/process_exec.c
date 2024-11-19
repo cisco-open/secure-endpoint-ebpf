@@ -90,7 +90,9 @@ int BPF_KPROBE(event_proc_exec_connector_probe, struct task_struct *task)
         return 0;
     }
 
-    if (!is_monitored_network_drive_exes(task)) {
+    if (!is_monitored_network_drive_exes(task,
+                                         &event->buf.exe_path_attributes.flags,
+                                         &event->buf.parent_exe_path_attributes.flags)) {
         return 0;
     }
 

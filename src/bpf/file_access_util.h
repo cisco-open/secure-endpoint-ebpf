@@ -271,7 +271,8 @@ static_inline bool has_recently_accessed_file(const struct task_struct *task,
 
 static_inline bool should_filter_accessed_file(const struct task_struct *task,
                                                const struct dentry *dentry,
-                                               uint8_t operation)
+                                               uint8_t operation,
+                                               struct bpf_file_event_buf *buf)
 {
     if (!is_monitored_with_path(dentry)) {
         return true;
@@ -286,7 +287,10 @@ static_inline bool should_filter_accessed_file(const struct task_struct *task,
     }
 
     const struct inode *inode = BPF_CORE_READ(dentry, d_inode);
-    if (!is_monitored_network_drive_file(inode) || !is_monitored_network_drive_exes(task)) {
+    if (!is_monitored_network_drive_file(inode, &buf->file_path_attributes.flags) ||
+        !is_monitored_network_drive_exes(task,
+                                         &buf->exe_path_attributes.flags,
+                                         &buf->parent_exe_path_attributes.flags)) {
         return true;
     }
 

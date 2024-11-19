@@ -39,8 +39,16 @@ struct {
 static_inline struct bpf_network_release_event *populate_common_network_release_event(struct sock *sock,
                                                                                       size_t *offset)
 {
+    const u32 zero = 0;
+    struct bpf_network_release_event *event = bpf_map_lookup_elem(&heap_network_release_event, &zero);
+    if (!event) {
+        return NULL;
+    }
+
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (!is_monitored_network_drive_exes(task)) {
+    if (!is_monitored_network_drive_exes(task,
+                                         &event->buf.exe_path_attributes.flags,
+                                         &event->buf.parent_exe_path_attributes.flags)) {
         return 0;
     }
 
@@ -52,11 +60,6 @@ static_inline struct bpf_network_release_event *populate_common_network_release_
         return NULL;
     }
 
-    const u32 zero = 0;
-    struct bpf_network_release_event *event = bpf_map_lookup_elem(&heap_network_release_event, &zero);
-    if (!event) {
-        return NULL;
-    }
     event->common.operation = bpf_operation_network_release;
     event->common.ktime = bpf_ktime_get_ns();
     event->current.pid = BPF_CORE_READ(task, tgid);

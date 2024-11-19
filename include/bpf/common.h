@@ -16,7 +16,7 @@
 
 #include <linux/limits.h>
 
-#define MAX_PATH_COMPONENTS 40
+#define MAX_PATH_COMPONENTS 256
 
 enum bpf_operation {
     bpf_operation_process_fork,
@@ -55,7 +55,7 @@ typedef struct bpf_file_path_flags {
     uint16_t path_truncated : 1;
     uint16_t path_malformed : 1;
     uint16_t path_from_specialfs : 1;
-    uint16_t path_from_remotefs : 1;
+    uint16_t path_scannable : 1;
     uint16_t : 11; // fill to 16 bits
 } bpf_file_path_flags_t;
 
