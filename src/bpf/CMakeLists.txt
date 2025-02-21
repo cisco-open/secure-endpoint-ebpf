@@ -14,6 +14,7 @@ set(vmlinux_include_dir ${CMAKE_CURRENT_SOURCE_DIR}/${se_ebpf_bpf_target_arch})
 
 # List of src files to convert from c -> objects -> skeleton files.
 set(src_files
+    ${CMAKE_CURRENT_SOURCE_DIR}/network-control/tc_classifier.c
     ${CMAKE_CURRENT_SOURCE_DIR}/probes/file_close_write.c
     ${CMAKE_CURRENT_SOURCE_DIR}/probes/file_create.c
     ${CMAKE_CURRENT_SOURCE_DIR}/probes/file_delete.c

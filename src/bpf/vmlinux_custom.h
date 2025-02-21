@@ -24,6 +24,9 @@
 
 #include "defines.h"
 
+#define TC_ACT_OK		0 /* Allow packet through tc classifier */
+#define TC_ACT_SHOT		2 /* Drop packet in tc classifier */
+
 #define CIFS_SUPER_MAGIC 0xFF534D42
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
@@ -148,7 +151,12 @@ struct module___older_v64 {
     struct module_layout core_layout;
 };
 
-// kernel >= v6.6 inode i_ctime field change
+// kernel < v6.11 inode ctime fields
+struct inode___older_v611 {
+    struct timespec64 __i_ctime;
+};
+
+// kernel < v6.6 inode ctime fields
 struct inode___older_v66 {
     struct timespec64 i_ctime;
 };
