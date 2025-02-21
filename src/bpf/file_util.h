@@ -37,9 +37,13 @@ static_inline uint64_t get_time_nanosec_timespec(struct timespec64 *ts)
 static_inline uint64_t get_ctime_nanosec_from_inode(const struct inode *inode)
 {
     struct timespec64 ts;
-    if (bpf_core_field_exists(inode->__i_ctime)) { // Version >= 6.6
-        ts = BPF_CORE_READ(inode, __i_ctime);
-    } else {
+    if (bpf_core_field_exists(inode->i_ctime_sec)) {
+        ts.tv_sec = BPF_CORE_READ(inode, i_ctime_sec);
+        ts.tv_nsec = BPF_CORE_READ(inode, i_ctime_nsec);
+    } else if (bpf_core_field_exists(struct inode___older_v611, __i_ctime)) { // Version < 6.11
+        struct inode___older_v611 *old_inode = (void *)inode;
+        ts = BPF_CORE_READ(old_inode, __i_ctime);
+    } else { // Version < 6.6
         struct inode___older_v66 *old_inode = (void *)inode;
         ts = BPF_CORE_READ(old_inode, i_ctime);
     }
