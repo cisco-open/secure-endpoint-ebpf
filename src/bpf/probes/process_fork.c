@@ -1,7 +1,7 @@
 /**
  * @file
  *
- * @copyright (c) 2024 Cisco Systems, Inc. All rights reserved
+ * @copyright (c) 2025 Cisco Systems, Inc. All rights reserved.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  * This library is free software; you can redistribute it and/or modify it under the
@@ -31,13 +31,6 @@ struct {
     __type(key, u32);
     __type(value, struct bpf_process_fork_event);
 } heap_process_fork_event SEC(".maps");
-
-static_inline bool is_new_thread_group(struct task_struct *task)
-{
-    const u32 tgid = BPF_CORE_READ(task, tgid);
-    const u32 pid = BPF_CORE_READ(task, pid);
-    return pid == tgid;
-}
 
 SEC("kprobe/wake_up_new_task")
 int BPF_KPROBE(event_wake_up_new_task, struct task_struct *task)
