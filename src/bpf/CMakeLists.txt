@@ -31,6 +31,7 @@ set(src_files
     ${CMAKE_CURRENT_SOURCE_DIR}/probes/process_exec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/probes/process_exit.c
     ${CMAKE_CURRENT_SOURCE_DIR}/probes/process_fork.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/trust/tpv_update.c
 )
 
 set(skel_files "")

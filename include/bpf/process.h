@@ -1,6 +1,6 @@
 /**
  * @file
- * @copyright (c) 2020-2024 Cisco Systems, Inc. All rights reserved
+ * @copyright (c) 2025 Cisco Systems, Inc. All rights reserved.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  * This library is free software; you can redistribute it and/or modify it under the
@@ -38,6 +38,7 @@ struct bpf_process {
     int32_t nspid;
     int32_t pgid;
     int32_t sid;
+    uint64_t start_time;
     struct bpf_user user;
 };
 

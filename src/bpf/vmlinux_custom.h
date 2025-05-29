@@ -24,6 +24,12 @@
 
 #include "defines.h"
 
+#define ETH_P_IP	0x0800 /* Internet Protocol packet	*/
+#define ETH_P_IPV6	0x86DD /* IPv6 */
+#define ETH_P_ARP   0x0806  /* Address Resolution Protocol */
+
+#define ETH_HLEN	14    /* Total octets in header */
+
 #define TC_ACT_OK		0 /* Allow packet through tc classifier */
 #define TC_ACT_SHOT		2 /* Drop packet in tc classifier */
 
@@ -107,7 +113,7 @@ struct kernfs_node___rh8 {
 struct sock___old {
     struct sock_common __sk_common;
     unsigned int __sk_flags_offset[0];
-    unsigned int sk_padding : 1, 
+    unsigned int sk_padding : 1,
                  sk_kern_sock : 1,
                  sk_no_check_tx : 1,
                  sk_no_check_rx : 1,

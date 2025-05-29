@@ -1,7 +1,7 @@
 /**
  * @file
  *
- * @copyright (c) 2024 Cisco Systems, Inc. All rights reserved
+ * @copyright (c) 2025 Cisco Systems, Inc. All rights reserved.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  * This library is free software; you can redistribute it and/or modify it under the
@@ -24,6 +24,13 @@ static_inline bool is_kthread(const struct task_struct *task)
 {
     const unsigned int flags = BPF_CORE_READ(task, flags);
     return flags & PF_KTHREAD;
+}
+
+static_inline bool is_new_thread_group(struct task_struct *task)
+{
+    const u32 tgid = BPF_CORE_READ(task, tgid);
+    const u32 pid = BPF_CORE_READ(task, pid);
+    return pid == tgid;
 }
 
 static_inline bool exclude_tgid(const struct task_struct *task)
@@ -59,6 +66,7 @@ static_inline void populate_process(struct bpf_process *proc, const struct task_
     }
     proc->pgid = task_pid(task, bpf_core_enum_value(enum pid_type, PIDTYPE_PGID));
     proc->sid = task_pid(task, bpf_core_enum_value(enum pid_type, PIDTYPE_SID));
+    proc->start_time = BPF_CORE_READ(task, start_time);
 
     proc->user.ruid = BPF_CORE_READ(task, cred, uid.val);
     proc->user.euid = BPF_CORE_READ(task, cred, euid.val);
