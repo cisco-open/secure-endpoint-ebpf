@@ -55,10 +55,11 @@ int BPF_KPROBE(tpv_task_alloc, struct task_struct *task)
     const struct file *file = BPF_CORE_READ(task, mm, exe_file);
     const struct path *path = __builtin_preserve_access_index(&file->f_path);
     const struct inode *inode = BPF_CORE_READ(path, dentry, d_inode);
-    get_file_id_in_place(file_id, inode);
-    if (file_id && is_file_trusted(file_id)) {
+    file_id_t new_file_id = {0};
+    get_file_id_in_place(&new_file_id, inode);
+    if (is_file_trusted(&new_file_id)) {
         // If path is trusted then child should be trusted.
-        add_trusted_pid(pid, file_id);
+        add_trusted_pid(pid, &new_file_id);
     }
 
     return 0;
