@@ -44,10 +44,6 @@ int BPF_KPROBE(kprobe_security_inode_unlink, struct inode *dir, struct dentry *d
     /* To invalidate our file maps even when processes that we do not
      * monitor touch them, we must do so before exclude_tgid */
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    struct file_access_id *file_access_id = gen_file_access_id(task, dentry, bpf_operation_file_delete);
-    if (file_access_id) {
-        remove_all_accessed_file(file_access_id);
-    }
 
     if (exclude_tgid(task)) {
         return 0;

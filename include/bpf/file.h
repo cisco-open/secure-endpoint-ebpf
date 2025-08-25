@@ -90,7 +90,7 @@ struct bpf_file_delete_event {
 struct file_access_id {
     uint64_t file_inode;
     uint64_t device;
-    uint32_t hash;
+    uint32_t i_generation;
     uint8_t operation;
 };
 

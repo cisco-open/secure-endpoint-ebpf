@@ -39,17 +39,6 @@ struct {
 } heap_file_pid_access_id SEC(".maps");
 
 /**
- * Declare file_access_times map to be linked to userspace FileAccessTimeMaps in the BTF AMF implementation.
- * It stores the access time keyed on the file access id.
- */
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 1);
-    __type(key, struct file_access_id);
-    __type(value, struct file_access_time);
-} file_access_times SEC(".maps");
-
-/**
  * Declare file_access_times_by_pid map to be linked to userspace FileAccessTimeMaps in the BTF AMF
  * implementation. It stores the access time keyed on the file access id.
  */
@@ -59,16 +48,6 @@ struct {
     __type(key, struct file_pid_access_id);
     __type(value, struct file_access_time);
 } file_access_times_by_pid SEC(".maps");
-
-static_inline void remove_all_accessed_file(struct file_access_id *file_access_id)
-{
-    file_access_id->operation = bpf_operation_file_close_write;
-    bpf_map_delete_elem(&file_access_times, file_access_id);
-    file_access_id->operation = bpf_operation_file_read;
-    bpf_map_delete_elem(&file_access_times, file_access_id);
-    file_access_id->operation = bpf_operation_file_write;
-    bpf_map_delete_elem(&file_access_times, file_access_id);
-}
 
 static_inline bool is_from_special_filesystem_type(long unsigned int magic)
 {
@@ -156,9 +135,7 @@ static_inline bool is_monitored_with_path(const struct dentry *dentry)
     return true;
 }
 
-static_inline struct file_access_id *gen_file_access_id(const struct task_struct *task,
-                                                        const struct dentry *dentry,
-                                                        uint8_t operation)
+static_inline struct file_access_id *gen_file_access_id(const struct dentry *dentry, uint8_t operation)
 {
     const u32 zero = 0;
     struct file_access_id *file_access_id = bpf_map_lookup_elem(&heap_file_access_id, &zero);
@@ -170,7 +147,7 @@ static_inline struct file_access_id *gen_file_access_id(const struct task_struct
 
     file_access_id->file_inode = BPF_CORE_READ(file_inode, i_ino);
     file_access_id->device = BPF_CORE_READ(file_inode, i_sb, s_dev);
-    file_access_id->hash = BPF_CORE_READ(dentry, d_name.hash);
+    file_access_id->i_generation = BPF_CORE_READ(file_inode, i_generation);
     file_access_id->operation = operation;
 
     return file_access_id;
@@ -191,18 +168,12 @@ static_inline struct file_pid_access_id *gen_file_pid_access_id(struct file_acce
 
     file_pid_access_id->id.file_inode = file_access_id->file_inode;
     file_pid_access_id->id.device = file_access_id->device;
+    file_pid_access_id->id.i_generation = file_access_id->i_generation;
     file_pid_access_id->id.operation = file_access_id->operation;
     file_pid_access_id->exe_inode = BPF_CORE_READ(exe_inode, i_ino);
     file_pid_access_id->tgid = BPF_CORE_READ(task, tgid);
 
     return file_pid_access_id;
-}
-
-static_inline bool init_access_time(const struct file_access_id *file_access_id, u64 current_time_ns)
-{
-    struct file_access_time access_time;
-    access_time.time_ns = current_time_ns;
-    return bpf_map_update_elem(&file_access_times, file_access_id, &access_time, BPF_NOEXIST) == 0;
 }
 
 static_inline bool init_pid_access_time(const struct file_pid_access_id *file_pid_access_id,
@@ -231,42 +202,31 @@ static_inline bool has_recently_accessed_file(const struct task_struct *task,
                                               const struct dentry *dentry,
                                               uint8_t operation)
 {
-    struct file_access_id *file_access_id = gen_file_access_id(task, dentry, operation);
+    struct file_access_id *file_access_id = gen_file_access_id(dentry, operation);
     if (!file_access_id) {
         return false;
     }
 
-    const u64 current_time_ns = bpf_ktime_get_ns();
-    if (init_access_time(file_access_id, current_time_ns)) {
-        struct file_pid_access_id *file_pid_access_id = gen_file_pid_access_id(file_access_id, task);
-        if (!file_pid_access_id) {
-            return false;
-        }
-        if (init_pid_access_time(file_pid_access_id, current_time_ns)) {
-            return false;
-        }
+    struct file_pid_access_id *file_pid_access_id = gen_file_pid_access_id(file_access_id, task);
+    if (!file_pid_access_id) {
         return false;
     }
 
-    struct file_access_time *access_time = bpf_map_lookup_elem(&file_access_times, file_access_id);
+    const u64 current_time_ns = bpf_ktime_get_ns();
+    if (init_pid_access_time(file_pid_access_id, current_time_ns)) {
+        return false;
+    }
+    struct file_access_time *access_time = bpf_map_lookup_elem(&file_access_times_by_pid,
+                                                               file_pid_access_id);
+
     if (!access_time) {
         return false;
     }
-    if (!resend_delay_elapsed(access_time, current_time_ns)) {
-        struct file_pid_access_id *file_pid_access_id = gen_file_pid_access_id(file_access_id, task);
-        if (!file_pid_access_id) {
-            return false;
-        }
-        if (init_pid_access_time(file_pid_access_id, current_time_ns)) {
-            return false;
-        }
-        access_time = bpf_map_lookup_elem(&file_access_times_by_pid, file_pid_access_id);
-        if (!access_time) {
-            return false;
-        }
-        return !resend_delay_elapsed(access_time, current_time_ns);
+
+    if (resend_delay_elapsed(access_time, current_time_ns)) {
+        return false;
     }
-    return false;
+    return true;
 }
 
 static_inline bool should_filter_accessed_file(const struct task_struct *task,
